@@ -1,0 +1,77 @@
+# MeterGPT 系統依賴套件
+
+# MetaGPT 框架
+metagpt>=0.8.0
+
+# 深度學習和電腦視覺
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# OCR 相關
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+easyocr>=1.7.0
+
+# 資料處理和驗證
+pydantic>=2.0.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# 異步處理
+asyncio-mqtt>=0.13.0
+aiofiles>=23.0.0
+aiohttp>=3.8.0
+
+# 配置管理
+pyyaml>=6.0
+python-dotenv>=1.0.0
+configparser>=5.3.0
+
+# 日誌和監控
+loguru>=0.7.0
+prometheus-client>=0.17.0
+psutil>=5.9.0
+
+# 影像處理增強
+scikit-image>=0.21.0
+imageio>=2.31.0
+matplotlib>=3.7.0
+
+# 網路和通訊
+requests>=2.31.0
+websockets>=11.0.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# 資料庫 (可選)
+sqlalchemy>=2.0.0
+sqlite3
+
+# 測試相關
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+
+# 開發工具
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+pre-commit>=3.3.0
+
+# 其他工具
+tqdm>=4.65.0
+rich>=13.5.0
+click>=8.1.0
+python-multipart>=0.0.6
+
+# VLM 相關 (可選)
+openai>=1.0.0
+anthropic>=0.3.0
+transformers>=4.30.0
+
+# PTZ 攝影機控制 (可選)
+onvif-zeep>=0.2.12
