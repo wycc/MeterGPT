@@ -1,6 +1,7 @@
 """
 StreamManager 代理人
-負責管理多個攝影機的影像串流，作為系統的資料中心匯流排
+負責管理多個攝影機的影像串流，主動推送影像幀到系統中
+基於 MetaGPT 的真正代理人協作模式
 """
 
 import asyncio
@@ -13,17 +14,15 @@ import threading
 from queue import Queue, Empty
 import time
 
-from metagpt.agent import Agent
-from metagpt.actions import Action
 from metagpt.roles import Role
+from metagpt.actions import Action
 from metagpt.schema import Message
 
 from ..models.messages import (
     StreamFrame, CameraInfo, AgentMessage, ProcessingStatus
 )
-from ..core.config import get_config
+from ..core.config import get_config, MeterGPTConfig
 from ..utils.logger import get_logger, log_agent_action
-from ..integrations.opencv_utils import StreamProcessor
 
 
 class StreamCaptureAction(Action):
@@ -44,12 +43,16 @@ class StreamCaptureAction(Action):
             Optional[StreamFrame]: 串流影像幀
         """
         try:
-            # 這裡應該實作實際的串流捕獲邏輯
-            # 為了示範，我們使用模擬資料
             frame_id = str(uuid.uuid4())
             
-            # 模擬影像資料 (實際應用中應該從 RTSP 串流讀取)
+            # 實際應用中應該從 RTSP 串流讀取
+            # 這裡使用模擬資料進行示範
             dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            
+            # 添加一些模擬的儀器圖案
+            cv2.rectangle(dummy_frame, (100, 100), (300, 200), (255, 255, 255), 2)
+            cv2.putText(dummy_frame, "123.45", (120, 160), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
             _, encoded_frame = cv2.imencode('.jpg', dummy_frame)
             frame_data = encoded_frame.tobytes()
             
@@ -60,7 +63,8 @@ class StreamCaptureAction(Action):
                 frame_shape=(480, 640, 3),
                 metadata={
                     'capture_method': 'rtsp',
-                    'encoding': 'jpg'
+                    'encoding': 'jpg',
+                    'simulated': True
                 }
             )
             
@@ -72,362 +76,334 @@ class StreamCaptureAction(Action):
             return None
 
 
-class StreamManagementAction(Action):
-    """串流管理動作"""
+class StreamPublishAction(Action):
+    """串流發布動作"""
     
     def __init__(self):
         super().__init__()
-        self.logger = get_logger("StreamManagementAction")
+        self.logger = get_logger("StreamPublishAction")
     
-    async def run(self, cameras: List[CameraInfo], 
-                 stream_buffers: Dict[str, Queue]) -> Dict[str, StreamFrame]:
+    async def run(self, stream_frame: StreamFrame) -> Message:
         """
-        管理多個攝影機串流
+        發布串流幀到環境
         
         Args:
-            cameras: 攝影機列表
-            stream_buffers: 串流緩衝區
+            stream_frame: 串流影像幀
             
         Returns:
-            Dict[str, StreamFrame]: 最新的串流幀
+            Message: 發布的訊息
         """
-        latest_frames = {}
-        
-        for camera in cameras:
-            if not camera.is_active:
-                continue
+        try:
+            message = Message(
+                content={
+                    "type": "stream_frame",
+                    "frame_id": stream_frame.frame_id,
+                    "camera_id": stream_frame.camera_info.camera_id,
+                    "stream_frame": stream_frame.dict(),
+                    "timestamp": datetime.now().isoformat()
+                },
+                role="StreamManager",
+                cause_by=type(self)
+            )
             
-            try:
-                # 從緩衝區取得最新幀
-                buffer = stream_buffers.get(camera.camera_id)
-                if buffer and not buffer.empty():
-                    try:
-                        latest_frame = buffer.get_nowait()
-                        latest_frames[camera.camera_id] = latest_frame
-                    except Empty:
-                        pass
-                
-            except Exception as e:
-                self.logger.error(
-                    f"串流管理失敗: {e}", 
-                    camera_id=camera.camera_id
-                )
-        
-        return latest_frames
+            self.logger.info(
+                f"發布影像幀: {stream_frame.frame_id}",
+                camera_id=stream_frame.camera_info.camera_id
+            )
+            
+            return message
+            
+        except Exception as e:
+            self.logger.error(f"串流發布失敗: {e}")
+            raise
 
 
 class StreamManager(Role):
-    """串流管理代理人"""
+    """串流管理代理人 - 基於 MetaGPT 的協作模式"""
     
-    def __init__(self, name: str = "StreamManager", **kwargs):
+    def __init__(self, config: Optional[MeterGPTConfig] = None):
         """
         初始化串流管理代理人
         
         Args:
-            name: 代理人名稱
+            config: 系統配置
         """
-        super().__init__(name=name, **kwargs)
+        super().__init__(
+            name="StreamManager",
+            profile="串流管理代理人",
+            goal="管理攝影機串流並主動推送影像幀",
+            constraints="確保串流的穩定性和品質"
+        )
         
-        # 設置動作
-        self._init_actions([StreamCaptureAction(), StreamManagementAction()])
-        
-        # 初始化屬性
-        self.cameras: List[CameraInfo] = []
-        self.stream_buffers: Dict[str, Queue] = {}
-        self.stream_processors: Dict[str, StreamProcessor] = {}
-        self.capture_threads: Dict[str, threading.Thread] = {}
-        self.is_running = False
-        
+        self.config = config or get_config()
         self.logger = get_logger("StreamManager")
         
-        # 載入配置
-        self._load_configuration()
+        # 設置動作
+        self._set_actions([
+            StreamCaptureAction(),
+            StreamPublishAction()
+        ])
+        
+        # 監聽系統啟動和攝影機控制訊息
+        self._watch([
+            "system_start",
+            "camera_switch_request",
+            "stream_request"
+        ])
+        
+        # 串流狀態
+        self.active_cameras: Dict[str, CameraInfo] = {}
+        self.stream_tasks: Dict[str, asyncio.Task] = {}
+        self.is_streaming = False
+        
+        # 初始化攝影機
+        self._initialize_cameras()
     
-    def _load_configuration(self):
-        """載入配置"""
+    def _initialize_cameras(self):
+        """初始化攝影機配置"""
         try:
-            config = get_config()
-            if config and config.cameras:
-                self.cameras = [
-                    CameraInfo(
-                        camera_id=cam.camera_id,
-                        camera_name=cam.camera_name,
-                        position=cam.position,
-                        is_active=cam.is_active,
-                        is_primary=cam.is_primary
-                    )
-                    for cam in config.cameras
-                ]
+            if self.config and self.config.cameras:
+                for camera_config in self.config.cameras:
+                    if camera_config.is_active:
+                        camera_info = CameraInfo(
+                            camera_id=camera_config.camera_id,
+                            camera_name=camera_config.camera_name,
+                            position=camera_config.position,
+                            is_active=camera_config.is_active,
+                            is_primary=camera_config.is_primary
+                        )
+                        self.active_cameras[camera_config.camera_id] = camera_info
                 
-                self.logger.info(f"載入了 {len(self.cameras)} 個攝影機配置")
+                self.logger.info(f"初始化 {len(self.active_cameras)} 台攝影機")
             else:
-                self.logger.warning("沒有找到攝影機配置")
+                # 建立預設攝影機
+                default_camera = CameraInfo(
+                    camera_id="default_cam",
+                    camera_name="預設攝影機",
+                    position=(0.0, 0.0, 0.0),
+                    is_active=True,
+                    is_primary=True
+                )
+                self.active_cameras["default_cam"] = default_camera
+                self.logger.info("使用預設攝影機配置")
                 
         except Exception as e:
-            self.logger.error(f"載入配置失敗: {e}")
+            self.logger.error(f"攝影機初始化失敗: {e}")
     
-    @log_agent_action("StreamManager")
     async def _act(self) -> Message:
-        """執行代理人動作"""
+        """
+        執行串流管理動作
+        
+        Returns:
+            Message: 動作結果訊息
+        """
         try:
-            # 啟動串流捕獲
-            if not self.is_running:
-                await self.start_streaming()
+            # 檢查是否有新的訊息需要處理
+            messages = self.rc.memory.get_by_actions([
+                "system_start",
+                "camera_switch_request", 
+                "stream_request"
+            ])
             
-            # 管理串流
-            action = StreamManagementAction()
-            latest_frames = await action.run(self.cameras, self.stream_buffers)
+            # 處理控制訊息
+            for message in messages:
+                await self._handle_control_message(message)
             
-            # 建立回應訊息
-            message_content = {
-                'action': 'stream_management',
-                'active_cameras': len([c for c in self.cameras if c.is_active]),
-                'latest_frames': len(latest_frames),
-                'timestamp': datetime.now().isoformat()
-            }
+            # 如果串流已啟動，繼續捕獲和發布影像
+            if self.is_streaming:
+                return await self._capture_and_publish()
+            else:
+                # 自動啟動串流（如果有活躍攝影機）
+                if self.active_cameras:
+                    await self._start_streaming()
+                    return await self._capture_and_publish()
             
             return Message(
-                content=str(message_content),
-                role=self.profile,
-                cause_by=StreamManagementAction
+                content={"type": "no_action", "status": "waiting"},
+                role=self.profile
             )
             
         except Exception as e:
-            self.logger.error(f"代理人動作執行失敗: {e}")
+            self.logger.error(f"串流管理動作失敗: {e}")
             return Message(
-                content=f"Error: {str(e)}",
-                role=self.profile,
-                cause_by=StreamManagementAction
+                content={"type": "error", "error": str(e)},
+                role=self.profile
             )
     
-    async def start_streaming(self):
-        """啟動串流捕獲"""
+    async def _handle_control_message(self, message: Message):
+        """處理控制訊息"""
         try:
-            self.is_running = True
+            msg_type = message.content.get("type")
             
-            for camera in self.cameras:
-                if camera.is_active:
-                    # 建立緩衝區和處理器
-                    self.stream_buffers[camera.camera_id] = Queue(maxsize=10)
-                    self.stream_processors[camera.camera_id] = StreamProcessor()
+            if msg_type == "system_start":
+                await self._start_streaming()
+            
+            elif msg_type == "camera_switch_request":
+                camera_id = message.content.get("alternative_camera_id")
+                if camera_id and camera_id in self.active_cameras:
+                    await self._switch_camera(camera_id)
+            
+            elif msg_type == "stream_request":
+                frame_id = message.content.get("frame_id")
+                if frame_id:
+                    await self._handle_stream_request(frame_id)
                     
-                    # 啟動捕獲執行緒
-                    capture_thread = threading.Thread(
-                        target=self._capture_loop,
-                        args=(camera,),
-                        daemon=True
-                    )
-                    capture_thread.start()
-                    self.capture_threads[camera.camera_id] = capture_thread
-            
-            self.logger.info("串流捕獲已啟動")
-            
         except Exception as e:
-            self.logger.error(f"啟動串流失敗: {e}")
-            raise
+            self.logger.error(f"控制訊息處理失敗: {e}")
     
-    def _capture_loop(self, camera: CameraInfo):
-        """攝影機捕獲迴圈"""
+    async def _start_streaming(self):
+        """啟動串流"""
         try:
-            # 實際應用中應該使用 OpenCV 連接 RTSP 串流
-            # cap = cv2.VideoCapture(camera.rtsp_url)
-            
-            while self.is_running:
-                try:
-                    # 模擬捕獲影像
-                    frame_id = str(uuid.uuid4())
-                    dummy_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-                    _, encoded_frame = cv2.imencode('.jpg', dummy_frame)
-                    frame_data = encoded_frame.tobytes()
-                    
-                    stream_frame = StreamFrame(
-                        frame_id=frame_id,
-                        camera_info=camera,
-                        frame_data=frame_data,
-                        frame_shape=(480, 640, 3),
-                        metadata={'source': 'simulation'}
-                    )
-                    
-                    # 添加到緩衝區
-                    buffer = self.stream_buffers[camera.camera_id]
-                    if buffer.full():
-                        try:
-                            buffer.get_nowait()  # 移除舊幀
-                        except Empty:
-                            pass
-                    
-                    buffer.put(stream_frame)
-                    
-                    # 添加到處理器
-                    processor = self.stream_processors[camera.camera_id]
-                    frame_array = cv2.imdecode(
-                        np.frombuffer(frame_data, np.uint8), 
-                        cv2.IMREAD_COLOR
-                    )
-                    processor.add_frame(frame_array, time.time())
-                    
-                    # 控制幀率
-                    time.sleep(1.0 / 30.0)  # 30 FPS
-                    
-                except Exception as e:
-                    self.logger.error(f"捕獲迴圈錯誤: {e}", camera_id=camera.camera_id)
-                    time.sleep(1.0)
-            
+            if not self.is_streaming:
+                self.is_streaming = True
+                self.logger.info("串流已啟動")
+                
+                # 為每個活躍攝影機啟動串流任務
+                for camera_id, camera_info in self.active_cameras.items():
+                    if camera_info.is_active:
+                        task = asyncio.create_task(
+                            self._continuous_streaming(camera_info)
+                        )
+                        self.stream_tasks[camera_id] = task
+                        
         except Exception as e:
-            self.logger.error(f"捕獲迴圈失敗: {e}", camera_id=camera.camera_id)
+            self.logger.error(f"串流啟動失敗: {e}")
     
-    async def stop_streaming(self):
-        """停止串流捕獲"""
-        try:
-            self.is_running = False
-            
-            # 等待所有執行緒結束
-            for thread in self.capture_threads.values():
-                if thread.is_alive():
-                    thread.join(timeout=5.0)
-            
-            self.capture_threads.clear()
-            self.stream_buffers.clear()
-            self.stream_processors.clear()
-            
-            self.logger.info("串流捕獲已停止")
-            
-        except Exception as e:
-            self.logger.error(f"停止串流失敗: {e}")
-    
-    def get_latest_frame(self, camera_id: str) -> Optional[StreamFrame]:
-        """
-        取得指定攝影機的最新影像幀
+    async def _continuous_streaming(self, camera_info: CameraInfo):
+        """持續串流處理"""
+        capture_action = StreamCaptureAction()
+        publish_action = StreamPublishAction()
         
-        Args:
-            camera_id: 攝影機 ID
-            
-        Returns:
-            Optional[StreamFrame]: 最新的影像幀
-        """
+        while self.is_streaming and camera_info.is_active:
+            try:
+                # 捕獲影像幀
+                stream_frame = await capture_action.run(camera_info)
+                
+                if stream_frame:
+                    # 發布到環境
+                    message = await publish_action.run(stream_frame)
+                    await self.rc.env.publish_message(message)
+                
+                # 控制幀率（例如每秒 1 幀）
+                await asyncio.sleep(1.0)
+                
+            except Exception as e:
+                self.logger.error(f"持續串流錯誤: {e}")
+                await asyncio.sleep(5.0)  # 錯誤後等待重試
+    
+    async def _capture_and_publish(self) -> Message:
+        """捕獲並發布單一影像幀"""
         try:
-            buffer = self.stream_buffers.get(camera_id)
-            if buffer and not buffer.empty():
-                # 取得最新幀 (清空緩衝區並取得最後一幀)
-                latest_frame = None
-                while not buffer.empty():
-                    try:
-                        latest_frame = buffer.get_nowait()
-                    except Empty:
-                        break
-                return latest_frame
-            
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"取得最新幀失敗: {e}", camera_id=camera_id)
-            return None
-    
-    def get_stable_frame(self, camera_id: str) -> Optional[np.ndarray]:
-        """
-        取得指定攝影機的穩定影像幀
-        
-        Args:
-            camera_id: 攝影機 ID
-            
-        Returns:
-            Optional[np.ndarray]: 穩定的影像幀
-        """
-        try:
-            processor = self.stream_processors.get(camera_id)
-            if processor:
-                return processor.get_stable_frame()
-            
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"取得穩定幀失敗: {e}", camera_id=camera_id)
-            return None
-    
-    def get_primary_camera(self) -> Optional[CameraInfo]:
-        """取得主要攝影機"""
-        for camera in self.cameras:
-            if camera.is_primary and camera.is_active:
-                return camera
-        return None
-    
-    def get_backup_cameras(self) -> List[CameraInfo]:
-        """取得備援攝影機列表"""
-        return [
-            camera for camera in self.cameras 
-            if not camera.is_primary and camera.is_active
-        ]
-    
-    def switch_primary_camera(self, new_primary_id: str) -> bool:
-        """
-        切換主要攝影機
-        
-        Args:
-            new_primary_id: 新的主要攝影機 ID
-            
-        Returns:
-            bool: 是否成功切換
-        """
-        try:
-            # 找到新的主要攝影機
-            new_primary = None
-            for camera in self.cameras:
-                if camera.camera_id == new_primary_id:
-                    new_primary = camera
+            # 選擇主要攝影機或第一個活躍攝影機
+            primary_camera = None
+            for camera_info in self.active_cameras.values():
+                if camera_info.is_primary and camera_info.is_active:
+                    primary_camera = camera_info
                     break
             
-            if not new_primary or not new_primary.is_active:
-                self.logger.error(f"無法切換到攝影機: {new_primary_id}")
-                return False
+            if not primary_camera:
+                # 選擇第一個活躍攝影機
+                for camera_info in self.active_cameras.values():
+                    if camera_info.is_active:
+                        primary_camera = camera_info
+                        break
             
-            # 更新主要攝影機標記
-            for camera in self.cameras:
-                camera.is_primary = (camera.camera_id == new_primary_id)
+            if not primary_camera:
+                return Message(
+                    content={"type": "error", "error": "沒有可用的攝影機"},
+                    role=self.profile
+                )
             
-            self.logger.info(f"已切換主要攝影機到: {new_primary_id}")
-            return True
+            # 捕獲影像
+            capture_action = StreamCaptureAction()
+            stream_frame = await capture_action.run(primary_camera)
             
-        except Exception as e:
-            self.logger.error(f"切換主要攝影機失敗: {e}")
-            return False
-    
-    async def get_stream_status(self) -> Dict[str, any]:
-        """取得串流狀態"""
-        try:
-            status = {
-                'is_running': self.is_running,
-                'total_cameras': len(self.cameras),
-                'active_cameras': len([c for c in self.cameras if c.is_active]),
-                'primary_camera': None,
-                'camera_status': {}
-            }
-            
-            # 主要攝影機資訊
-            primary_camera = self.get_primary_camera()
-            if primary_camera:
-                status['primary_camera'] = primary_camera.camera_id
-            
-            # 各攝影機狀態
-            for camera in self.cameras:
-                buffer = self.stream_buffers.get(camera.camera_id)
-                buffer_size = buffer.qsize() if buffer else 0
+            if stream_frame:
+                # 發布影像
+                publish_action = StreamPublishAction()
+                message = await publish_action.run(stream_frame)
                 
-                status['camera_status'][camera.camera_id] = {
-                    'is_active': camera.is_active,
-                    'is_primary': camera.is_primary,
-                    'buffer_size': buffer_size,
-                    'thread_alive': camera.camera_id in self.capture_threads and 
-                                   self.capture_threads[camera.camera_id].is_alive()
-                }
-            
-            return status
+                # 發布到環境
+                await self.rc.env.publish_message(message)
+                
+                return Message(
+                    content={
+                        "type": "stream_published",
+                        "frame_id": stream_frame.frame_id,
+                        "camera_id": primary_camera.camera_id
+                    },
+                    role=self.profile
+                )
+            else:
+                return Message(
+                    content={"type": "capture_failed"},
+                    role=self.profile
+                )
+                
+        except Exception as e:
+            self.logger.error(f"捕獲發布失敗: {e}")
+            return Message(
+                content={"type": "error", "error": str(e)},
+                role=self.profile
+            )
+    
+    async def _switch_camera(self, camera_id: str):
+        """切換攝影機"""
+        try:
+            if camera_id in self.active_cameras:
+                # 停用其他攝影機
+                for cam_id, camera_info in self.active_cameras.items():
+                    camera_info.is_primary = (cam_id == camera_id)
+                
+                self.logger.info(f"切換到攝影機: {camera_id}")
+            else:
+                self.logger.warning(f"攝影機不存在: {camera_id}")
+                
+        except Exception as e:
+            self.logger.error(f"攝影機切換失敗: {e}")
+    
+    async def _handle_stream_request(self, frame_id: str):
+        """處理串流請求"""
+        try:
+            # 這裡可以實作特定的串流請求處理邏輯
+            self.logger.info(f"處理串流請求: {frame_id}")
             
         except Exception as e:
-            self.logger.error(f"取得串流狀態失敗: {e}")
-            return {'error': str(e)}
-
-
-# 建立全域 StreamManager 實例的工廠函數
-def create_stream_manager() -> StreamManager:
-    """建立 StreamManager 實例"""
-    return StreamManager()
+            self.logger.error(f"串流請求處理失敗: {e}")
+    
+    async def stop_streaming(self):
+        """停止串流"""
+        try:
+            self.is_streaming = False
+            
+            # 取消所有串流任務
+            for task in self.stream_tasks.values():
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            
+            self.stream_tasks.clear()
+            self.logger.info("串流已停止")
+            
+        except Exception as e:
+            self.logger.error(f"串流停止失敗: {e}")
+    
+    def get_active_cameras(self) -> List[CameraInfo]:
+        """取得活躍攝影機列表"""
+        return [camera for camera in self.active_cameras.values() if camera.is_active]
+    
+    def get_camera_status(self) -> Dict[str, Dict[str, Any]]:
+        """取得攝影機狀態"""
+        status = {}
+        for camera_id, camera_info in self.active_cameras.items():
+            status[camera_id] = {
+                "name": camera_info.camera_name,
+                "is_active": camera_info.is_active,
+                "is_primary": camera_info.is_primary,
+                "position": camera_info.position,
+                "has_stream_task": camera_id in self.stream_tasks
+            }
+        return status

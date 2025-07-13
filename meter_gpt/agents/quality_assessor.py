@@ -1,6 +1,7 @@
 """
 QualityAssessor 代理人
 負責評估影像品質，計算「健康分數」，為後續處理提供品質依據
+基於 MetaGPT 的真正代理人協作模式
 """
 
 import cv2
@@ -9,15 +10,14 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 import asyncio
 
-from metagpt.agent import Agent
-from metagpt.actions import Action
 from metagpt.roles import Role
+from metagpt.actions import Action
 from metagpt.schema import Message
 
 from ..models.messages import (
     StreamFrame, QualityReport, QualityMetrics, ProcessingStatus
 )
-from ..core.config import get_config
+from ..core.config import get_config, MeterGPTConfig
 from ..utils.logger import get_logger, log_agent_action
 from ..integrations.opencv_utils import quality_assessor
 
@@ -50,33 +50,27 @@ class QualityAssessmentAction(Action):
             if frame_array is None:
                 raise ValueError("無法解碼影像資料")
             
-            # 執行品質評估
-            quality_metrics = quality_assessor.assess_quality(frame_array)
+            # 計算品質指標
+            metrics = await self._calculate_quality_metrics(frame_array)
             
-            # 取得品質配置
-            quality_config = self.config.quality if self.config else None
-            overall_threshold = quality_config.overall_threshold if quality_config else 0.6
-            
-            # 判斷是否達到可接受品質
-            is_acceptable = quality_metrics.overall_score >= overall_threshold
+            # 判斷是否可接受
+            is_acceptable = self._is_quality_acceptable(metrics)
             
             # 生成改善建議
-            recommendations = self._generate_recommendations(quality_metrics, quality_config)
+            recommendations = self._generate_recommendations(metrics)
             
-            # 建立品質報告
             quality_report = QualityReport(
                 frame_id=stream_frame.frame_id,
                 camera_id=stream_frame.camera_info.camera_id,
-                metrics=quality_metrics,
+                metrics=metrics,
                 is_acceptable=is_acceptable,
                 recommendations=recommendations
             )
             
-            self.logger.log_quality_assessment(
-                stream_frame.frame_id,
-                stream_frame.camera_info.camera_id,
-                quality_metrics.overall_score,
-                is_acceptable
+            self.logger.info(
+                f"品質評估完成 - 整體分數: {metrics.overall_score:.3f}, "
+                f"可接受: {is_acceptable}",
+                frame_id=stream_frame.frame_id
             )
             
             return quality_report
@@ -84,10 +78,8 @@ class QualityAssessmentAction(Action):
         except Exception as e:
             self.logger.error(
                 f"品質評估失敗: {e}",
-                frame_id=stream_frame.frame_id,
-                camera_id=stream_frame.camera_info.camera_id
+                frame_id=stream_frame.frame_id
             )
-            
             # 返回預設的低品質報告
             return QualityReport(
                 frame_id=stream_frame.frame_id,
@@ -101,381 +93,279 @@ class QualityAssessmentAction(Action):
                     overall_score=0.0
                 ),
                 is_acceptable=False,
-                recommendations=["影像品質評估失敗，請檢查攝影機連接"]
+                recommendations=["影像處理失敗，請檢查攝影機"]
             )
     
-    def _generate_recommendations(self, metrics: QualityMetrics, 
-                                config: Optional[Any]) -> List[str]:
-        """
-        生成改善建議
-        
-        Args:
-            metrics: 品質指標
-            config: 品質配置
+    async def _calculate_quality_metrics(self, frame: np.ndarray) -> QualityMetrics:
+        """計算品質指標"""
+        try:
+            # 轉換為灰階
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             
-        Returns:
-            List[str]: 改善建議列表
-        """
+            # 計算清晰度 (使用 Laplacian 變異數)
+            sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+            sharpness_score = min(sharpness / 1000.0, 1.0)  # 正規化
+            
+            # 計算亮度
+            brightness = np.mean(gray) / 255.0
+            brightness_score = 1.0 - abs(brightness - 0.5) * 2  # 最佳亮度在 0.5 附近
+            
+            # 計算對比度
+            contrast = np.std(gray) / 255.0
+            contrast_score = min(contrast * 4, 1.0)  # 正規化
+            
+            # 計算遮擋比例 (簡化版本)
+            # 檢測過暗或過亮的區域
+            dark_pixels = np.sum(gray < 30)
+            bright_pixels = np.sum(gray > 225)
+            total_pixels = gray.shape[0] * gray.shape[1]
+            occlusion_ratio = (dark_pixels + bright_pixels) / total_pixels
+            
+            # 計算失真分數 (簡化版本)
+            # 使用邊緣檢測來評估失真
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / total_pixels
+            distortion_score = min(edge_density * 10, 1.0)
+            
+            # 計算整體分數
+            weights = [0.3, 0.2, 0.2, 0.15, 0.15]  # 各指標權重
+            scores = [
+                sharpness_score,
+                brightness_score,
+                contrast_score,
+                1.0 - occlusion_ratio,  # 遮擋比例越低越好
+                distortion_score
+            ]
+            overall_score = sum(w * s for w, s in zip(weights, scores))
+            
+            return QualityMetrics(
+                sharpness_score=sharpness_score,
+                brightness_score=brightness_score,
+                contrast_score=contrast_score,
+                occlusion_ratio=occlusion_ratio,
+                distortion_score=distortion_score,
+                overall_score=overall_score
+            )
+            
+        except Exception as e:
+            self.logger.error(f"品質指標計算失敗: {e}")
+            # 返回預設低品質指標
+            return QualityMetrics(
+                sharpness_score=0.0,
+                brightness_score=0.0,
+                contrast_score=0.0,
+                occlusion_ratio=1.0,
+                distortion_score=0.0,
+                overall_score=0.0
+            )
+    
+    def _is_quality_acceptable(self, metrics: QualityMetrics) -> bool:
+        """判斷品質是否可接受"""
+        try:
+            if self.config and self.config.quality:
+                threshold = self.config.quality.overall_threshold
+            else:
+                threshold = 0.6  # 預設閾值
+            
+            return metrics.overall_score >= threshold
+            
+        except Exception as e:
+            self.logger.error(f"品質判斷失敗: {e}")
+            return False
+    
+    def _generate_recommendations(self, metrics: QualityMetrics) -> List[str]:
+        """生成改善建議"""
         recommendations = []
         
         try:
-            # 清晰度建議
-            sharpness_threshold = config.sharpness_threshold if config else 0.3
-            if metrics.sharpness_score < sharpness_threshold:
-                recommendations.append("影像清晰度不足，建議調整攝影機焦距或清潔鏡頭")
+            if metrics.sharpness_score < 0.3:
+                recommendations.append("影像模糊，建議調整攝影機焦距")
             
-            # 亮度建議
-            brightness_range = config.brightness_range if config else (0.2, 0.8)
             if metrics.brightness_score < 0.5:
-                if metrics.brightness_score < brightness_range[0]:
-                    recommendations.append("影像過暗，建議增加照明或調整攝影機曝光設定")
-                elif metrics.brightness_score > brightness_range[1]:
-                    recommendations.append("影像過亮，建議減少照明或調整攝影機曝光設定")
+                recommendations.append("亮度不佳，建議調整光源或曝光設定")
             
-            # 對比度建議
-            contrast_threshold = config.contrast_threshold if config else 0.3
-            if metrics.contrast_score < contrast_threshold:
-                recommendations.append("影像對比度不足，建議調整攝影機對比度設定或改善照明條件")
+            if metrics.contrast_score < 0.3:
+                recommendations.append("對比度不足，建議調整攝影機設定")
             
-            # 遮擋建議
-            occlusion_threshold = config.occlusion_threshold if config else 0.3
-            if metrics.occlusion_ratio > occlusion_threshold:
-                recommendations.append("檢測到影像遮擋，建議清除攝影機視野中的障礙物")
+            if metrics.occlusion_ratio > 0.3:
+                recommendations.append("存在遮擋或過曝區域，建議調整攝影機角度")
             
-            # 失真建議
-            if metrics.distortion_score < 0.5:
-                recommendations.append("檢測到影像失真，建議調整攝影機角度或位置")
+            if metrics.distortion_score < 0.2:
+                recommendations.append("影像失真嚴重，建議檢查攝影機鏡頭")
             
-            # 整體品質建議
-            if metrics.overall_score < 0.4:
-                recommendations.append("整體影像品質較差，建議考慮切換到備援攝影機")
-            elif metrics.overall_score < 0.6:
-                recommendations.append("影像品質需要改善，建議進行攝影機維護")
+            if not recommendations:
+                recommendations.append("影像品質良好")
             
         except Exception as e:
-            self.logger.error(f"生成建議失敗: {e}")
-            recommendations.append("品質分析異常，請檢查系統狀態")
+            self.logger.error(f"建議生成失敗: {e}")
+            recommendations = ["品質評估異常，請檢查系統"]
         
         return recommendations
 
 
-class BatchQualityAssessmentAction(Action):
-    """批次品質評估動作"""
+class QualityReportAction(Action):
+    """品質報告發布動作"""
     
     def __init__(self):
         super().__init__()
-        self.logger = get_logger("BatchQualityAssessmentAction")
+        self.logger = get_logger("QualityReportAction")
     
-    async def run(self, stream_frames: List[StreamFrame]) -> List[QualityReport]:
+    async def run(self, quality_report: QualityReport) -> Message:
         """
-        批次執行品質評估
+        發布品質報告
         
         Args:
-            stream_frames: 串流影像幀列表
+            quality_report: 品質評估報告
             
         Returns:
-            List[QualityReport]: 品質評估報告列表
+            Message: 品質報告訊息
         """
         try:
-            assessment_action = QualityAssessmentAction()
+            message = Message(
+                content={
+                    "type": "quality_report",
+                    "frame_id": quality_report.frame_id,
+                    "camera_id": quality_report.camera_id,
+                    "quality_report": quality_report.dict(),
+                    "is_acceptable": quality_report.is_acceptable,
+                    "overall_score": quality_report.metrics.overall_score,
+                    "timestamp": datetime.now().isoformat()
+                },
+                role="QualityAssessor",
+                cause_by=type(self)
+            )
             
-            # 並行處理多個影像幀
-            tasks = [
-                assessment_action.run(frame) 
-                for frame in stream_frames
-            ]
+            self.logger.info(
+                f"發布品質報告: {quality_report.frame_id}, "
+                f"分數: {quality_report.metrics.overall_score:.3f}",
+                camera_id=quality_report.camera_id
+            )
             
-            quality_reports = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # 過濾異常結果
-            valid_reports = []
-            for report in quality_reports:
-                if isinstance(report, QualityReport):
-                    valid_reports.append(report)
-                else:
-                    self.logger.error(f"品質評估異常: {report}")
-            
-            return valid_reports
+            return message
             
         except Exception as e:
-            self.logger.error(f"批次品質評估失敗: {e}")
-            return []
+            self.logger.error(f"品質報告發布失敗: {e}")
+            raise
 
 
 class QualityAssessor(Role):
-    """品質評估代理人"""
+    """品質評估代理人 - 基於 MetaGPT 的協作模式"""
     
-    def __init__(self, name: str = "QualityAssessor", **kwargs):
+    def __init__(self, config: Optional[MeterGPTConfig] = None):
         """
         初始化品質評估代理人
         
         Args:
-            name: 代理人名稱
+            config: 系統配置
         """
-        super().__init__(name=name, **kwargs)
+        super().__init__(
+            name="QualityAssessor",
+            profile="品質評估代理人",
+            goal="評估影像品質並提供改善建議",
+            constraints="確保只有高品質影像進入後續處理流程"
+        )
+        
+        self.config = config or get_config()
+        self.logger = get_logger("QualityAssessor")
         
         # 設置動作
-        self._init_actions([
+        self._set_actions([
             QualityAssessmentAction(),
-            BatchQualityAssessmentAction()
+            QualityReportAction()
         ])
         
-        self.logger = get_logger("QualityAssessor")
-        self.config = get_config()
+        # 監聽串流幀和品質評估請求
+        self._watch([
+            "stream_frame",
+            "quality_assessment_request"
+        ])
         
-        # 品質歷史記錄
-        self.quality_history: Dict[str, List[QualityReport]] = {}
-        self.max_history_size = 100
+        # 統計資訊
+        self.assessment_count = 0
+        self.acceptable_count = 0
     
-    @log_agent_action("QualityAssessor")
     async def _act(self) -> Message:
-        """執行代理人動作"""
+        """
+        執行品質評估動作
+        
+        Returns:
+            Message: 評估結果訊息
+        """
         try:
-            # 從訊息中取得串流幀
-            stream_frames = []
-            for msg in self.rc.memory.get():
-                if hasattr(msg, 'content') and 'stream_frame' in str(msg.content):
-                    # 這裡應該解析訊息內容取得 StreamFrame
-                    # 為了示範，我們跳過實際解析
-                    pass
+            # 取得需要評估的串流幀訊息
+            messages = self.rc.memory.get_by_actions([
+                "stream_frame",
+                "quality_assessment_request"
+            ])
             
-            if not stream_frames:
+            if not messages:
                 return Message(
-                    content="沒有收到串流幀資料",
-                    role=self.profile,
-                    cause_by=QualityAssessmentAction
+                    content={"type": "no_action", "status": "waiting"},
+                    role=self.profile
                 )
             
+            # 處理最新的訊息
+            latest_message = messages[-1]
+            stream_frame_data = latest_message.content.get("stream_frame")
+            
+            if not stream_frame_data:
+                return Message(
+                    content={"type": "error", "error": "沒有找到串流幀資料"},
+                    role=self.profile
+                )
+            
+            # 重建 StreamFrame 物件
+            stream_frame = StreamFrame(**stream_frame_data)
+            
             # 執行品質評估
-            action = BatchQualityAssessmentAction()
-            quality_reports = await action.run(stream_frames)
+            assessment_action = QualityAssessmentAction()
+            quality_report = await assessment_action.run(stream_frame)
             
-            # 更新品質歷史
-            self._update_quality_history(quality_reports)
+            # 更新統計
+            self.assessment_count += 1
+            if quality_report.is_acceptable:
+                self.acceptable_count += 1
             
-            # 建立回應訊息
-            message_content = {
-                'action': 'quality_assessment',
-                'reports_count': len(quality_reports),
-                'acceptable_count': len([r for r in quality_reports if r.is_acceptable]),
-                'average_score': self._calculate_average_score(quality_reports),
-                'timestamp': datetime.now().isoformat()
-            }
+            # 發布品質報告
+            report_action = QualityReportAction()
+            report_message = await report_action.run(quality_report)
+            
+            # 發布到環境
+            await self.rc.env.publish_message(report_message)
             
             return Message(
-                content=str(message_content),
-                role=self.profile,
-                cause_by=BatchQualityAssessmentAction
+                content={
+                    "type": "quality_assessment_complete",
+                    "frame_id": stream_frame.frame_id,
+                    "is_acceptable": quality_report.is_acceptable,
+                    "overall_score": quality_report.metrics.overall_score
+                },
+                role=self.profile
             )
             
         except Exception as e:
-            self.logger.error(f"代理人動作執行失敗: {e}")
+            self.logger.error(f"品質評估動作失敗: {e}")
             return Message(
-                content=f"Error: {str(e)}",
-                role=self.profile,
-                cause_by=QualityAssessmentAction
+                content={"type": "error", "error": str(e)},
+                role=self.profile
             )
     
-    async def assess_single_frame(self, stream_frame: StreamFrame) -> QualityReport:
-        """
-        評估單一影像幀
+    def get_assessment_statistics(self) -> Dict[str, Any]:
+        """取得評估統計資訊"""
+        acceptance_rate = (
+            self.acceptable_count / self.assessment_count 
+            if self.assessment_count > 0 else 0.0
+        )
         
-        Args:
-            stream_frame: 串流影像幀
-            
-        Returns:
-            QualityReport: 品質評估報告
-        """
-        try:
-            action = QualityAssessmentAction()
-            quality_report = await action.run(stream_frame)
-            
-            # 更新品質歷史
-            self._update_single_quality_history(quality_report)
-            
-            return quality_report
-            
-        except Exception as e:
-            self.logger.error(f"單一幀品質評估失敗: {e}")
-            raise
+        return {
+            "total_assessments": self.assessment_count,
+            "acceptable_count": self.acceptable_count,
+            "acceptance_rate": acceptance_rate,
+            "rejection_count": self.assessment_count - self.acceptable_count
+        }
     
-    async def assess_multiple_frames(self, stream_frames: List[StreamFrame]) -> List[QualityReport]:
-        """
-        評估多個影像幀
-        
-        Args:
-            stream_frames: 串流影像幀列表
-            
-        Returns:
-            List[QualityReport]: 品質評估報告列表
-        """
-        try:
-            action = BatchQualityAssessmentAction()
-            quality_reports = await action.run(stream_frames)
-            
-            # 更新品質歷史
-            self._update_quality_history(quality_reports)
-            
-            return quality_reports
-            
-        except Exception as e:
-            self.logger.error(f"多幀品質評估失敗: {e}")
-            raise
-    
-    def _update_quality_history(self, quality_reports: List[QualityReport]):
-        """更新品質歷史記錄"""
-        try:
-            for report in quality_reports:
-                self._update_single_quality_history(report)
-        except Exception as e:
-            self.logger.error(f"更新品質歷史失敗: {e}")
-    
-    def _update_single_quality_history(self, quality_report: QualityReport):
-        """更新單一品質歷史記錄"""
-        try:
-            camera_id = quality_report.camera_id
-            
-            if camera_id not in self.quality_history:
-                self.quality_history[camera_id] = []
-            
-            self.quality_history[camera_id].append(quality_report)
-            
-            # 限制歷史記錄大小
-            if len(self.quality_history[camera_id]) > self.max_history_size:
-                self.quality_history[camera_id].pop(0)
-                
-        except Exception as e:
-            self.logger.error(f"更新單一品質歷史失敗: {e}")
-    
-    def _calculate_average_score(self, quality_reports: List[QualityReport]) -> float:
-        """計算平均品質分數"""
-        if not quality_reports:
-            return 0.0
-        
-        total_score = sum(report.metrics.overall_score for report in quality_reports)
-        return total_score / len(quality_reports)
-    
-    def get_camera_quality_trend(self, camera_id: str, window_size: int = 10) -> Dict[str, float]:
-        """
-        取得攝影機品質趨勢
-        
-        Args:
-            camera_id: 攝影機 ID
-            window_size: 視窗大小
-            
-        Returns:
-            Dict[str, float]: 品質趨勢指標
-        """
-        try:
-            history = self.quality_history.get(camera_id, [])
-            if len(history) < 2:
-                return {'trend': 0.0, 'stability': 0.0, 'current_score': 0.0}
-            
-            # 取得最近的記錄
-            recent_history = history[-window_size:]
-            scores = [report.metrics.overall_score for report in recent_history]
-            
-            # 計算趨勢 (線性回歸斜率)
-            if len(scores) >= 2:
-                x = list(range(len(scores)))
-                n = len(scores)
-                sum_x = sum(x)
-                sum_y = sum(scores)
-                sum_xy = sum(x[i] * scores[i] for i in range(n))
-                sum_x2 = sum(x[i] ** 2 for i in range(n))
-                
-                trend = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x ** 2)
-            else:
-                trend = 0.0
-            
-            # 計算穩定性 (標準差的倒數)
-            if len(scores) > 1:
-                mean_score = sum(scores) / len(scores)
-                variance = sum((score - mean_score) ** 2 for score in scores) / len(scores)
-                stability = 1.0 / (1.0 + variance)
-            else:
-                stability = 1.0
-            
-            return {
-                'trend': trend,
-                'stability': stability,
-                'current_score': scores[-1] if scores else 0.0,
-                'average_score': sum(scores) / len(scores) if scores else 0.0
-            }
-            
-        except Exception as e:
-            self.logger.error(f"取得品質趨勢失敗: {e}")
-            return {'trend': 0.0, 'stability': 0.0, 'current_score': 0.0}
-    
-    def get_best_quality_camera(self, camera_ids: List[str]) -> Optional[str]:
-        """
-        取得品質最佳的攝影機
-        
-        Args:
-            camera_ids: 攝影機 ID 列表
-            
-        Returns:
-            Optional[str]: 品質最佳的攝影機 ID
-        """
-        try:
-            best_camera = None
-            best_score = -1.0
-            
-            for camera_id in camera_ids:
-                trend_data = self.get_camera_quality_trend(camera_id)
-                current_score = trend_data['current_score']
-                
-                if current_score > best_score:
-                    best_score = current_score
-                    best_camera = camera_id
-            
-            return best_camera
-            
-        except Exception as e:
-            self.logger.error(f"取得最佳品質攝影機失敗: {e}")
-            return None
-    
-    async def get_quality_summary(self) -> Dict[str, Any]:
-        """取得品質摘要"""
-        try:
-            summary = {
-                'total_cameras': len(self.quality_history),
-                'camera_quality': {},
-                'overall_health': 0.0,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            total_score = 0.0
-            camera_count = 0
-            
-            for camera_id, history in self.quality_history.items():
-                if history:
-                    latest_report = history[-1]
-                    trend_data = self.get_camera_quality_trend(camera_id)
-                    
-                    summary['camera_quality'][camera_id] = {
-                        'current_score': latest_report.metrics.overall_score,
-                        'is_acceptable': latest_report.is_acceptable,
-                        'trend': trend_data['trend'],
-                        'stability': trend_data['stability'],
-                        'last_assessment': latest_report.timestamp.isoformat()
-                    }
-                    
-                    total_score += latest_report.metrics.overall_score
-                    camera_count += 1
-            
-            # 計算整體健康度
-            if camera_count > 0:
-                summary['overall_health'] = total_score / camera_count
-            
-            return summary
-            
-        except Exception as e:
-            self.logger.error(f"取得品質摘要失敗: {e}")
-            return {'error': str(e)}
-
-
-# 建立全域 QualityAssessor 實例的工廠函數
-def create_quality_assessor() -> QualityAssessor:
-    """建立 QualityAssessor 實例"""
-    return QualityAssessor()
+    def reset_statistics(self):
+        """重置統計資訊"""
+        self.assessment_count = 0
+        self.acceptable_count = 0
+        self.logger.info("品質評估統計已重置")

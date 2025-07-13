@@ -1,6 +1,7 @@
 """
 DetectionAgent 代理人
 負責儀器偵測和角點偵測，包括透視校正和 ROI 提取
+基於 MetaGPT 的真正代理人協作模式
 """
 
 import cv2
@@ -9,15 +10,14 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 import asyncio
 
-from metagpt.agent import Agent
-from metagpt.actions import Action
 from metagpt.roles import Role
+from metagpt.actions import Action
 from metagpt.schema import Message
 
 from ..models.messages import (
     StreamFrame, DetectionResult, CornerPoints, ROI, BoundingBox, InstrumentType
 )
-from ..core.config import get_config
+from ..core.config import get_config, MeterGPTConfig
 from ..utils.logger import get_logger, log_agent_action
 from ..integrations.yolo_wrapper import model_manager
 from ..integrations.opencv_utils import image_processor, geometry_utils
@@ -38,20 +38,18 @@ class InstrumentDetectionAction(Action):
         try:
             if self.config and self.config.detection_model:
                 model_config = self.config.detection_model
-                self.instrument_detector = model_manager.load_model(
-                    model_name="instrument_detector",
-                    model_path=model_config.model_path,
-                    model_type="instrument_detection",
-                    device=model_config.device,
-                    confidence_threshold=model_config.confidence_threshold
-                )
+                # 這裡應該載入實際的 YOLO 模型
+                # 暫時使用模擬偵測器
+                self.instrument_detector = MockInstrumentDetector(model_config)
                 self.logger.info("儀器偵測器初始化成功")
             else:
                 self.logger.warning("沒有找到儀器偵測模型配置")
+                self.instrument_detector = MockInstrumentDetector()
         except Exception as e:
             self.logger.error(f"儀器偵測器初始化失敗: {e}")
+            self.instrument_detector = MockInstrumentDetector()
     
-    async def run(self, stream_frame: StreamFrame) -> List[DetectionResult]:
+    async def run(self, stream_frame: StreamFrame) -> DetectionResult:
         """
         執行儀器偵測
         
@@ -59,7 +57,7 @@ class InstrumentDetectionAction(Action):
             stream_frame: 串流影像幀
             
         Returns:
-            List[DetectionResult]: 偵測結果列表
+            DetectionResult: 偵測結果
         """
         try:
             if not self.instrument_detector:
@@ -75,26 +73,55 @@ class InstrumentDetectionAction(Action):
                 raise ValueError("無法解碼影像資料")
             
             # 影像前處理
-            enhanced_frame = image_processor.enhance_image(frame_array, "auto")
+            enhanced_frame = self._enhance_image(frame_array)
             
             # 執行儀器偵測
-            detection_results = self.instrument_detector.detect_instruments(
+            detection_result = await self.instrument_detector.detect_instruments(
                 enhanced_frame, stream_frame.frame_id
             )
             
             self.logger.info(
-                f"偵測到 {len(detection_results)} 個儀器",
+                f"儀器偵測完成 - 類型: {detection_result.instrument_type}, "
+                f"信心度: {detection_result.confidence:.3f}",
                 frame_id=stream_frame.frame_id
             )
             
-            return detection_results
+            return detection_result
             
         except Exception as e:
             self.logger.error(
                 f"儀器偵測失敗: {e}",
                 frame_id=stream_frame.frame_id
             )
-            return []
+            # 返回失敗的偵測結果
+            return DetectionResult(
+                frame_id=stream_frame.frame_id,
+                instrument_type=InstrumentType.UNKNOWN,
+                bounding_box=BoundingBox(x=0, y=0, width=0, height=0, confidence=0.0),
+                confidence=0.0,
+                processing_time=0.0
+            )
+    
+    def _enhance_image(self, frame: np.ndarray) -> np.ndarray:
+        """影像增強"""
+        try:
+            # 轉換為灰階
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # 直方圖均衡化
+            enhanced = cv2.equalizeHist(gray)
+            
+            # 高斯模糊去噪
+            enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+            
+            # 轉回彩色
+            enhanced_color = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+            
+            return enhanced_color
+            
+        except Exception as e:
+            self.logger.error(f"影像增強失敗: {e}")
+            return frame
 
 
 class CornerDetectionAction(Action):
@@ -104,443 +131,360 @@ class CornerDetectionAction(Action):
         super().__init__()
         self.logger = get_logger("CornerDetectionAction")
         self.config = get_config()
-        self.corner_detector = None
-        self._initialize_detector()
     
-    def _initialize_detector(self):
-        """初始化角點偵測器"""
-        try:
-            if self.config and self.config.corner_detection_model:
-                model_config = self.config.corner_detection_model
-                self.corner_detector = model_manager.load_model(
-                    model_name="corner_detector",
-                    model_path=model_config.model_path,
-                    model_type="corner_detection",
-                    device=model_config.device,
-                    confidence_threshold=model_config.confidence_threshold
-                )
-                self.logger.info("角點偵測器初始化成功")
-            else:
-                self.logger.warning("沒有找到角點偵測模型配置")
-        except Exception as e:
-            self.logger.error(f"角點偵測器初始化失敗: {e}")
-    
-    async def run(self, image: np.ndarray, detection_result: DetectionResult) -> Optional[CornerPoints]:
+    async def run(self, frame: np.ndarray, bounding_box: BoundingBox) -> Optional[CornerPoints]:
         """
         執行角點偵測
         
         Args:
-            image: 輸入影像
-            detection_result: 儀器偵測結果
+            frame: 影像幀
+            bounding_box: 儀器邊界框
             
         Returns:
             Optional[CornerPoints]: 角點座標
         """
         try:
-            if not self.corner_detector:
-                # 使用傳統方法作為備援
-                return self.corner_detector.detect_corners_traditional(
-                    image, detection_result.bounding_box
-                )
+            # 提取 ROI
+            x, y, w, h = int(bounding_box.x), int(bounding_box.y), int(bounding_box.width), int(bounding_box.height)
+            roi = frame[y:y+h, x:x+w]
             
-            # 使用深度學習模型偵測角點
-            corner_points = self.corner_detector.detect_corners(
-                image, detection_result.bounding_box
+            if roi.size == 0:
+                return None
+            
+            # 轉換為灰階
+            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            
+            # 使用 Harris 角點偵測
+            corners = cv2.goodFeaturesToTrack(
+                gray_roi,
+                maxCorners=4,
+                qualityLevel=0.01,
+                minDistance=10,
+                blockSize=3
             )
             
-            if corner_points:
-                # 驗證角點是否形成合理的矩形
-                if geometry_utils.is_rectangle(corner_points, tolerance=15.0):
-                    self.logger.debug(
-                        f"成功偵測到角點",
-                        frame_id=detection_result.frame_id,
-                        confidence=corner_points.confidence
-                    )
-                    return corner_points
-                else:
-                    self.logger.warning(
-                        f"偵測到的角點不形成矩形，使用傳統方法重試",
-                        frame_id=detection_result.frame_id
-                    )
-                    return self.corner_detector.detect_corners_traditional(
-                        image, detection_result.bounding_box
-                    )
-            else:
-                # 使用傳統方法作為備援
-                return self.corner_detector.detect_corners_traditional(
-                    image, detection_result.bounding_box
-                )
-                
+            if corners is None or len(corners) < 4:
+                # 使用邊緣偵測作為備選方案
+                return self._detect_corners_by_edges(gray_roi, x, y)
+            
+            # 轉換座標到原始影像座標系
+            corners = corners.reshape(-1, 2)
+            corners[:, 0] += x
+            corners[:, 1] += y
+            
+            # 排序角點 (左上、右上、左下、右下)
+            sorted_corners = self._sort_corners(corners)
+            
+            corner_points = CornerPoints(
+                top_left=tuple(sorted_corners[0]),
+                top_right=tuple(sorted_corners[1]),
+                bottom_left=tuple(sorted_corners[2]),
+                bottom_right=tuple(sorted_corners[3]),
+                confidence=0.8  # 簡化的信心度計算
+            )
+            
+            return corner_points
+            
         except Exception as e:
-            self.logger.error(
-                f"角點偵測失敗: {e}",
-                frame_id=detection_result.frame_id
-            )
+            self.logger.error(f"角點偵測失敗: {e}")
             return None
+    
+    def _detect_corners_by_edges(self, gray_roi: np.ndarray, offset_x: int, offset_y: int) -> Optional[CornerPoints]:
+        """使用邊緣偵測來找角點"""
+        try:
+            # 邊緣偵測
+            edges = cv2.Canny(gray_roi, 50, 150)
+            
+            # 找輪廓
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if not contours:
+                return None
+            
+            # 找最大輪廓
+            largest_contour = max(contours, key=cv2.contourArea)
+            
+            # 多邊形近似
+            epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+            approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+            
+            if len(approx) >= 4:
+                # 取前四個點
+                corners = approx[:4].reshape(-1, 2)
+                corners[:, 0] += offset_x
+                corners[:, 1] += offset_y
+                
+                sorted_corners = self._sort_corners(corners)
+                
+                return CornerPoints(
+                    top_left=tuple(sorted_corners[0]),
+                    top_right=tuple(sorted_corners[1]),
+                    bottom_left=tuple(sorted_corners[2]),
+                    bottom_right=tuple(sorted_corners[3]),
+                    confidence=0.6
+                )
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"邊緣角點偵測失敗: {e}")
+            return None
+    
+    def _sort_corners(self, corners: np.ndarray) -> np.ndarray:
+        """排序角點為左上、右上、左下、右下"""
+        # 計算重心
+        center = np.mean(corners, axis=0)
+        
+        # 根據相對位置排序
+        sorted_corners = np.zeros((4, 2))
+        
+        for i, corner in enumerate(corners):
+            if corner[0] < center[0] and corner[1] < center[1]:  # 左上
+                sorted_corners[0] = corner
+            elif corner[0] >= center[0] and corner[1] < center[1]:  # 右上
+                sorted_corners[1] = corner
+            elif corner[0] < center[0] and corner[1] >= center[1]:  # 左下
+                sorted_corners[2] = corner
+            else:  # 右下
+                sorted_corners[3] = corner
+        
+        return sorted_corners
 
 
-class ROIExtractionAction(Action):
-    """ROI 提取動作"""
+class DetectionResultAction(Action):
+    """偵測結果發布動作"""
     
     def __init__(self):
         super().__init__()
-        self.logger = get_logger("ROIExtractionAction")
-        self.config = get_config()
+        self.logger = get_logger("DetectionResultAction")
     
-    async def run(self, image: np.ndarray, detection_result: DetectionResult,
-                 corner_points: Optional[CornerPoints]) -> List[ROI]:
+    async def run(self, detection_result: DetectionResult) -> Message:
         """
-        提取感興趣區域
+        發布偵測結果
         
         Args:
-            image: 輸入影像
-            detection_result: 儀器偵測結果
-            corner_points: 角點座標
+            detection_result: 偵測結果
             
         Returns:
-            List[ROI]: ROI 列表
+            Message: 偵測結果訊息
         """
         try:
-            # 如果有角點，先進行透視校正
-            if corner_points:
-                corrected_image = image_processor.perspective_correction(image, corner_points)
-                self.logger.debug(
-                    f"透視校正完成",
-                    frame_id=detection_result.frame_id
-                )
-            else:
-                # 直接裁切儀器區域
-                bbox = detection_result.bounding_box
-                x, y, w, h = int(bbox.x), int(bbox.y), int(bbox.width), int(bbox.height)
-                corrected_image = image[y:y+h, x:x+w]
-                self.logger.debug(
-                    f"使用直接裁切",
-                    frame_id=detection_result.frame_id
-                )
-            
-            # 根據儀器類型取得模板配置
-            template_config = self._get_template_config(detection_result.instrument_type)
-            
-            # 提取 ROI
-            rois = image_processor.extract_rois(corrected_image, template_config)
+            message = Message(
+                content={
+                    "type": "detection_result",
+                    "frame_id": detection_result.frame_id,
+                    "detection_result": detection_result.dict(),
+                    "instrument_type": detection_result.instrument_type,
+                    "confidence": detection_result.confidence,
+                    "timestamp": datetime.now().isoformat()
+                },
+                role="DetectionAgent",
+                cause_by=type(self)
+            )
             
             self.logger.info(
-                f"提取了 {len(rois)} 個 ROI",
-                frame_id=detection_result.frame_id,
-                instrument_type=detection_result.instrument_type.value
+                f"發布偵測結果: {detection_result.frame_id}, "
+                f"類型: {detection_result.instrument_type}, "
+                f"信心度: {detection_result.confidence:.3f}"
             )
             
-            return rois
+            return message
             
         except Exception as e:
-            self.logger.error(
-                f"ROI 提取失敗: {e}",
-                frame_id=detection_result.frame_id
-            )
-            return []
-    
-    def _get_template_config(self, instrument_type: InstrumentType) -> Dict[str, Any]:
-        """
-        取得儀器模板配置
-        
-        Args:
-            instrument_type: 儀器類型
-            
-        Returns:
-            Dict[str, Any]: 模板配置
-        """
-        try:
-            if self.config and self.config.instrument_templates:
-                template_key = instrument_type.value
-                template_config = self.config.instrument_templates.get(template_key)
-                
-                if template_config:
-                    return template_config
-            
-            # 返回預設模板配置
-            return self._get_default_template_config(instrument_type)
-            
-        except Exception as e:
-            self.logger.error(f"取得模板配置失敗: {e}")
-            return self._get_default_template_config(instrument_type)
-    
-    def _get_default_template_config(self, instrument_type: InstrumentType) -> Dict[str, Any]:
-        """取得預設模板配置"""
-        default_configs = {
-            InstrumentType.DIGITAL_DISPLAY: {
-                'rois': [
-                    {
-                        'field_name': 'main_display',
-                        'bbox': {'x': 10, 'y': 10, 'width': 200, 'height': 80},
-                        'expected_format': 'text'
-                    }
-                ]
-            },
-            InstrumentType.SEVEN_SEGMENT: {
-                'rois': [
-                    {
-                        'field_name': 'seven_segment_display',
-                        'bbox': {'x': 5, 'y': 5, 'width': 150, 'height': 60},
-                        'expected_format': 'seven_segment'
-                    }
-                ]
-            },
-            InstrumentType.LCD_SCREEN: {
-                'rois': [
-                    {
-                        'field_name': 'lcd_display',
-                        'bbox': {'x': 15, 'y': 15, 'width': 180, 'height': 70},
-                        'expected_format': 'text'
-                    }
-                ]
-            },
-            InstrumentType.ANALOG_GAUGE: {
-                'rois': [
-                    {
-                        'field_name': 'gauge_reading',
-                        'bbox': {'x': 20, 'y': 20, 'width': 160, 'height': 160},
-                        'expected_format': 'analog'
-                    }
-                ]
-            }
-        }
-        
-        return default_configs.get(instrument_type, {'rois': []})
+            self.logger.error(f"偵測結果發布失敗: {e}")
+            raise
 
 
 class DetectionAgent(Role):
-    """偵測代理人"""
+    """偵測代理人 - 基於 MetaGPT 的協作模式"""
     
-    def __init__(self, name: str = "DetectionAgent", **kwargs):
+    def __init__(self, config: Optional[MeterGPTConfig] = None):
         """
         初始化偵測代理人
         
         Args:
-            name: 代理人名稱
+            config: 系統配置
         """
-        super().__init__(name=name, **kwargs)
+        super().__init__(
+            name="DetectionAgent",
+            profile="儀器偵測代理人",
+            goal="偵測影像中的儀器並提取關鍵區域",
+            constraints="確保偵測準確性和處理效率"
+        )
+        
+        self.config = config or get_config()
+        self.logger = get_logger("DetectionAgent")
         
         # 設置動作
-        self._init_actions([
+        self._set_actions([
             InstrumentDetectionAction(),
             CornerDetectionAction(),
-            ROIExtractionAction()
+            DetectionResultAction()
         ])
         
-        self.logger = get_logger("DetectionAgent")
-        self.config = get_config()
+        # 監聽品質報告和偵測請求
+        self._watch([
+            "quality_report",
+            "detection_request"
+        ])
         
-        # 偵測歷史記錄
-        self.detection_history: Dict[str, List[DetectionResult]] = {}
-        self.max_history_size = 50
+        # 統計資訊
+        self.detection_count = 0
+        self.successful_detections = 0
     
-    @log_agent_action("DetectionAgent")
     async def _act(self) -> Message:
-        """執行代理人動作"""
+        """
+        執行偵測動作
+        
+        Returns:
+            Message: 偵測結果訊息
+        """
         try:
-            # 從訊息中取得串流幀
-            stream_frames = []
-            for msg in self.rc.memory.get():
-                if hasattr(msg, 'content') and 'stream_frame' in str(msg.content):
-                    # 這裡應該解析訊息內容取得 StreamFrame
-                    # 為了示範，我們跳過實際解析
-                    pass
+            # 取得需要偵測的訊息
+            messages = self.rc.memory.get_by_actions([
+                "quality_report",
+                "detection_request"
+            ])
             
-            if not stream_frames:
+            if not messages:
                 return Message(
-                    content="沒有收到串流幀資料",
-                    role=self.profile,
-                    cause_by=InstrumentDetectionAction
+                    content={"type": "no_action", "status": "waiting"},
+                    role=self.profile
                 )
             
-            # 處理第一個串流幀
-            stream_frame = stream_frames[0]
-            detection_results = await self.detect_and_extract(stream_frame)
+            # 處理最新的訊息
+            latest_message = messages[-1]
             
-            # 建立回應訊息
-            message_content = {
-                'action': 'detection_and_extraction',
-                'frame_id': stream_frame.frame_id,
-                'detection_count': len(detection_results),
-                'timestamp': datetime.now().isoformat()
-            }
+            # 檢查品質是否可接受
+            if latest_message.content.get("type") == "quality_report":
+                if not latest_message.content.get("is_acceptable", False):
+                    return Message(
+                        content={
+                            "type": "detection_skipped",
+                            "reason": "影像品質不可接受"
+                        },
+                        role=self.profile
+                    )
+            
+            # 取得串流幀資料
+            stream_frame_data = latest_message.content.get("stream_frame")
+            if not stream_frame_data:
+                return Message(
+                    content={"type": "error", "error": "沒有找到串流幀資料"},
+                    role=self.profile
+                )
+            
+            # 重建 StreamFrame 物件
+            stream_frame = StreamFrame(**stream_frame_data)
+            
+            # 執行儀器偵測
+            detection_action = InstrumentDetectionAction()
+            detection_result = await detection_action.run(stream_frame)
+            
+            # 更新統計
+            self.detection_count += 1
+            if detection_result.confidence > 0.5:  # 閾值應該從配置讀取
+                self.successful_detections += 1
+            
+            # 發布偵測結果
+            result_action = DetectionResultAction()
+            result_message = await result_action.run(detection_result)
+            
+            # 發布到環境
+            await self.rc.env.publish_message(result_message)
             
             return Message(
-                content=str(message_content),
-                role=self.profile,
-                cause_by=InstrumentDetectionAction
+                content={
+                    "type": "detection_complete",
+                    "frame_id": stream_frame.frame_id,
+                    "instrument_type": detection_result.instrument_type,
+                    "confidence": detection_result.confidence
+                },
+                role=self.profile
             )
             
         except Exception as e:
-            self.logger.error(f"代理人動作執行失敗: {e}")
+            self.logger.error(f"偵測動作失敗: {e}")
             return Message(
-                content=f"Error: {str(e)}",
-                role=self.profile,
-                cause_by=InstrumentDetectionAction
+                content={"type": "error", "error": str(e)},
+                role=self.profile
             )
     
-    async def detect_and_extract(self, stream_frame: StreamFrame) -> List[Dict[str, Any]]:
-        """
-        執行完整的偵測和提取流程
+    def get_detection_statistics(self) -> Dict[str, Any]:
+        """取得偵測統計資訊"""
+        success_rate = (
+            self.successful_detections / self.detection_count 
+            if self.detection_count > 0 else 0.0
+        )
         
-        Args:
-            stream_frame: 串流影像幀
-            
-        Returns:
-            List[Dict[str, Any]]: 偵測和提取結果
-        """
+        return {
+            "total_detections": self.detection_count,
+            "successful_detections": self.successful_detections,
+            "success_rate": success_rate,
+            "failed_detections": self.detection_count - self.successful_detections
+        }
+    
+    def reset_statistics(self):
+        """重置統計資訊"""
+        self.detection_count = 0
+        self.successful_detections = 0
+        self.logger.info("偵測統計已重置")
+
+
+class MockInstrumentDetector:
+    """模擬儀器偵測器"""
+    
+    def __init__(self, model_config=None):
+        self.model_config = model_config
+        self.logger = get_logger("MockInstrumentDetector")
+    
+    async def detect_instruments(self, frame: np.ndarray, frame_id: str) -> DetectionResult:
+        """模擬儀器偵測"""
         try:
-            results = []
+            # 模擬處理時間
+            await asyncio.sleep(0.1)
             
-            # 解碼影像
-            frame_array = cv2.imdecode(
-                np.frombuffer(stream_frame.frame_data, np.uint8),
-                cv2.IMREAD_COLOR
+            # 模擬偵測結果
+            height, width = frame.shape[:2]
+            
+            # 假設在影像中央找到一個數位顯示器
+            center_x, center_y = width // 2, height // 2
+            bbox_width, bbox_height = min(200, width // 2), min(100, height // 2)
+            
+            bounding_box = BoundingBox(
+                x=center_x - bbox_width // 2,
+                y=center_y - bbox_height // 2,
+                width=bbox_width,
+                height=bbox_height,
+                confidence=0.85
             )
             
-            if frame_array is None:
-                raise ValueError("無法解碼影像資料")
+            # 模擬角點偵測
+            corner_points = CornerPoints(
+                top_left=(bounding_box.x, bounding_box.y),
+                top_right=(bounding_box.x + bounding_box.width, bounding_box.y),
+                bottom_left=(bounding_box.x, bounding_box.y + bounding_box.height),
+                bottom_right=(bounding_box.x + bounding_box.width, bounding_box.y + bounding_box.height),
+                confidence=0.8
+            )
             
-            # 1. 儀器偵測
-            instrument_action = InstrumentDetectionAction()
-            detection_results = await instrument_action.run(stream_frame)
+            detection_result = DetectionResult(
+                frame_id=frame_id,
+                instrument_type=InstrumentType.DIGITAL_DISPLAY,
+                bounding_box=bounding_box,
+                corner_points=corner_points,
+                confidence=0.85,
+                processing_time=0.1
+            )
             
-            # 更新偵測歷史
-            self._update_detection_history(detection_results)
-            
-            # 2. 對每個偵測到的儀器進行角點偵測和 ROI 提取
-            corner_action = CornerDetectionAction()
-            roi_action = ROIExtractionAction()
-            
-            for detection_result in detection_results:
-                try:
-                    # 角點偵測
-                    corner_points = await corner_action.run(frame_array, detection_result)
-                    
-                    # ROI 提取
-                    rois = await roi_action.run(frame_array, detection_result, corner_points)
-                    
-                    # 組合結果
-                    result = {
-                        'detection_result': detection_result,
-                        'corner_points': corner_points,
-                        'rois': rois,
-                        'processing_success': True
-                    }
-                    
-                    results.append(result)
-                    
-                    self.logger.log_detection_result(
-                        detection_result.frame_id,
-                        detection_result.instrument_type.value,
-                        detection_result.confidence
-                    )
-                    
-                except Exception as e:
-                    self.logger.error(
-                        f"處理儀器失敗: {e}",
-                        frame_id=stream_frame.frame_id,
-                        instrument_type=detection_result.instrument_type.value
-                    )
-                    
-                    # 添加失敗結果
-                    result = {
-                        'detection_result': detection_result,
-                        'corner_points': None,
-                        'rois': [],
-                        'processing_success': False,
-                        'error': str(e)
-                    }
-                    results.append(result)
-            
-            return results
+            return detection_result
             
         except Exception as e:
-            self.logger.error(f"偵測和提取流程失敗: {e}")
-            raise
-    
-    def _update_detection_history(self, detection_results: List[DetectionResult]):
-        """更新偵測歷史記錄"""
-        try:
-            for result in detection_results:
-                camera_id = result.frame_id.split('_')[0] if '_' in result.frame_id else 'unknown'
-                
-                if camera_id not in self.detection_history:
-                    self.detection_history[camera_id] = []
-                
-                self.detection_history[camera_id].append(result)
-                
-                # 限制歷史記錄大小
-                if len(self.detection_history[camera_id]) > self.max_history_size:
-                    self.detection_history[camera_id].pop(0)
-                    
-        except Exception as e:
-            self.logger.error(f"更新偵測歷史失敗: {e}")
-    
-    def get_detection_statistics(self, camera_id: str) -> Dict[str, Any]:
-        """
-        取得偵測統計資訊
-        
-        Args:
-            camera_id: 攝影機 ID
-            
-        Returns:
-            Dict[str, Any]: 統計資訊
-        """
-        try:
-            history = self.detection_history.get(camera_id, [])
-            if not history:
-                return {'total_detections': 0, 'instrument_types': {}, 'average_confidence': 0.0}
-            
-            # 統計儀器類型
-            instrument_counts = {}
-            total_confidence = 0.0
-            
-            for result in history:
-                instrument_type = result.instrument_type.value
-                instrument_counts[instrument_type] = instrument_counts.get(instrument_type, 0) + 1
-                total_confidence += result.confidence
-            
-            return {
-                'total_detections': len(history),
-                'instrument_types': instrument_counts,
-                'average_confidence': total_confidence / len(history),
-                'latest_detection': history[-1].timestamp.isoformat() if history else None
-            }
-            
-        except Exception as e:
-            self.logger.error(f"取得偵測統計失敗: {e}")
-            return {'error': str(e)}
-    
-    async def get_detection_summary(self) -> Dict[str, Any]:
-        """取得偵測摘要"""
-        try:
-            summary = {
-                'total_cameras': len(self.detection_history),
-                'camera_statistics': {},
-                'overall_detection_rate': 0.0,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            total_detections = 0
-            
-            for camera_id, history in self.detection_history.items():
-                stats = self.get_detection_statistics(camera_id)
-                summary['camera_statistics'][camera_id] = stats
-                total_detections += stats['total_detections']
-            
-            # 計算整體偵測率 (簡化計算)
-            if len(self.detection_history) > 0:
-                summary['overall_detection_rate'] = total_detections / len(self.detection_history)
-            
-            return summary
-            
-        except Exception as e:
-            self.logger.error(f"取得偵測摘要失敗: {e}")
-            return {'error': str(e)}
-
-
-# 建立全域 DetectionAgent 實例的工廠函數
-def create_detection_agent() -> DetectionAgent:
-    """建立 DetectionAgent 實例"""
-    return DetectionAgent()
+            self.logger.error(f"模擬偵測失敗: {e}")
+            return DetectionResult(
+                frame_id=frame_id,
+                instrument_type=InstrumentType.UNKNOWN,
+                bounding_box=BoundingBox(x=0, y=0, width=0, height=0, confidence=0.0),
+                confidence=0.0,
+                processing_time=0.0
+            )

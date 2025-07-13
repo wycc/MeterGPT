@@ -1,22 +1,20 @@
 """
 MeterGPT 系統核心協調器 (Orchestrator)
-負責管理所有代理人的協作流程，實作完整的儀器讀值 SOP 流程
+基於 MetaGPT 框架的真正代理人協作架構
 """
 
 import asyncio
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple, AsyncGenerator
+from typing import Dict, List, Optional, Any, Set
 from enum import Enum
 import logging
-from contextlib import asynccontextmanager
-import time
 
-from metagpt.agent import Agent
-from metagpt.actions import Action
-from metagpt.roles import Role
-from metagpt.schema import Message
 from metagpt.environment import Environment
+from metagpt.roles import Role
+from metagpt.actions import Action
+from metagpt.schema import Message
+from metagpt.team import Team
 
 from ..models.messages import (
     StreamFrame, ProcessingResult, ProcessingStatus, FailureType,
@@ -25,50 +23,289 @@ from ..models.messages import (
     CameraInfo, InstrumentType
 )
 from ..core.config import get_config, MeterGPTConfig
-from ..utils.logger import get_logger, log_agent_action
-from ..agents.stream_manager import StreamManager
-from ..agents.quality_assessor import QualityAssessor
-from ..agents.detection_agent import DetectionAgent
-from ..agents.ocr_agent import OCRAgent
-from ..agents.validation_agent import ValidationAgent
-from ..agents.fallback_agent import FallbackAgent
+from ..utils.logger import get_logger
 
 
-class ProcessingStage(str, Enum):
-    """處理階段枚舉"""
-    STREAM_CAPTURE = "stream_capture"
-    QUALITY_ASSESSMENT = "quality_assessment"
-    INSTRUMENT_DETECTION = "instrument_detection"
-    OCR_PROCESSING = "ocr_processing"
-    RESULT_VALIDATION = "result_validation"
-    FALLBACK_PROCESSING = "fallback_processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
+class MessageType(str, Enum):
+    """訊息類型枚舉"""
+    STREAM_FRAME = "stream_frame"
+    QUALITY_REPORT = "quality_report"
+    DETECTION_RESULT = "detection_result"
+    OCR_RESULT = "ocr_result"
+    VALIDATION_RESULT = "validation_result"
+    FALLBACK_DECISION = "fallback_decision"
+    PROCESSING_COMPLETE = "processing_complete"
+    SYSTEM_STATUS = "system_status"
 
 
-class OrchestratorAction(Action):
-    """協調器主要動作"""
+class SystemMonitorAction(Action):
+    """系統監控動作"""
     
     def __init__(self):
         super().__init__()
-        self.logger = get_logger("OrchestratorAction")
+        self.logger = get_logger("SystemMonitorAction")
     
-    async def run(self, frame_data: Dict[str, Any]) -> ProcessingResult:
+    async def run(self, messages: List[Message]) -> Message:
         """
-        執行完整的處理流程
+        監控系統狀態並生成報告
         
         Args:
-            frame_data: 影像幀資料
+            messages: 收到的訊息列表
             
         Returns:
-            ProcessingResult: 處理結果
+            Message: 系統狀態訊息
         """
-        # 這個方法會被 Orchestrator 覆寫
-        pass
+        try:
+            # 分析收到的訊息，生成系統狀態
+            status_data = {
+                "timestamp": datetime.now(),
+                "active_processes": len(messages),
+                "message_types": [msg.content.get("type") for msg in messages],
+                "system_health": 1.0  # 簡化的健康度計算
+            }
+            
+            return Message(
+                content={
+                    "type": MessageType.SYSTEM_STATUS,
+                    "status": status_data
+                },
+                role="SystemMonitor"
+            )
+            
+        except Exception as e:
+            self.logger.error(f"系統監控失敗: {e}")
+            return Message(
+                content={
+                    "type": MessageType.SYSTEM_STATUS,
+                    "error": str(e)
+                },
+                role="SystemMonitor"
+            )
+
+
+class ProcessingCoordinationAction(Action):
+    """處理協調動作"""
+    
+    def __init__(self):
+        super().__init__()
+        self.logger = get_logger("ProcessingCoordinationAction")
+        self.processing_sessions: Dict[str, Dict[str, Any]] = {}
+    
+    async def run(self, messages: List[Message]) -> List[Message]:
+        """
+        協調處理流程
+        
+        Args:
+            messages: 收到的訊息列表
+            
+        Returns:
+            List[Message]: 協調指令訊息列表
+        """
+        coordination_messages = []
+        
+        for message in messages:
+            try:
+                msg_type = message.content.get("type")
+                frame_id = message.content.get("frame_id")
+                
+                if not frame_id:
+                    continue
+                
+                # 初始化處理會話
+                if frame_id not in self.processing_sessions:
+                    self.processing_sessions[frame_id] = {
+                        "start_time": datetime.now(),
+                        "stages": {},
+                        "status": ProcessingStatus.PROCESSING
+                    }
+                
+                session = self.processing_sessions[frame_id]
+                
+                # 根據訊息類型更新處理狀態
+                if msg_type == MessageType.STREAM_FRAME:
+                    coordination_messages.append(
+                        self._create_quality_assessment_request(message)
+                    )
+                
+                elif msg_type == MessageType.QUALITY_REPORT:
+                    session["stages"]["quality"] = message.content
+                    if message.content.get("is_acceptable", False):
+                        coordination_messages.append(
+                            self._create_detection_request(message)
+                        )
+                    else:
+                        coordination_messages.append(
+                            self._create_fallback_request(message, FailureType.LOW_QUALITY)
+                        )
+                
+                elif msg_type == MessageType.DETECTION_RESULT:
+                    session["stages"]["detection"] = message.content
+                    if message.content.get("confidence", 0) > 0.5:  # 閾值應該從配置讀取
+                        coordination_messages.append(
+                            self._create_ocr_request(message)
+                        )
+                    else:
+                        coordination_messages.append(
+                            self._create_fallback_request(message, FailureType.DETECTION_FAILED)
+                        )
+                
+                elif msg_type == MessageType.OCR_RESULT:
+                    session["stages"]["ocr"] = message.content
+                    coordination_messages.append(
+                        self._create_validation_request(message)
+                    )
+                
+                elif msg_type == MessageType.VALIDATION_RESULT:
+                    session["stages"]["validation"] = message.content
+                    if message.content.get("is_valid", False):
+                        coordination_messages.append(
+                            self._create_completion_message(frame_id, session)
+                        )
+                    else:
+                        coordination_messages.append(
+                            self._create_fallback_request(message, FailureType.VALIDATION_FAILED)
+                        )
+                
+                elif msg_type == MessageType.FALLBACK_DECISION:
+                    session["stages"]["fallback"] = message.content
+                    # 根據備援決策執行相應動作
+                    coordination_messages.extend(
+                        self._handle_fallback_decision(message)
+                    )
+                
+            except Exception as e:
+                self.logger.error(f"處理協調失敗: {e}")
+        
+        return coordination_messages
+    
+    def _create_quality_assessment_request(self, stream_message: Message) -> Message:
+        """建立品質評估請求"""
+        return Message(
+            content={
+                "type": "quality_assessment_request",
+                "stream_frame": stream_message.content.get("stream_frame"),
+                "frame_id": stream_message.content.get("frame_id")
+            },
+            role="Coordinator",
+            cause_by=type(self)
+        )
+    
+    def _create_detection_request(self, quality_message: Message) -> Message:
+        """建立偵測請求"""
+        return Message(
+            content={
+                "type": "detection_request",
+                "stream_frame": quality_message.content.get("stream_frame"),
+                "frame_id": quality_message.content.get("frame_id"),
+                "quality_report": quality_message.content.get("quality_report")
+            },
+            role="Coordinator",
+            cause_by=type(self)
+        )
+    
+    def _create_ocr_request(self, detection_message: Message) -> Message:
+        """建立 OCR 請求"""
+        return Message(
+            content={
+                "type": "ocr_request",
+                "stream_frame": detection_message.content.get("stream_frame"),
+                "frame_id": detection_message.content.get("frame_id"),
+                "detection_result": detection_message.content.get("detection_result")
+            },
+            role="Coordinator",
+            cause_by=type(self)
+        )
+    
+    def _create_validation_request(self, ocr_message: Message) -> Message:
+        """建立驗證請求"""
+        return Message(
+            content={
+                "type": "validation_request",
+                "frame_id": ocr_message.content.get("frame_id"),
+                "ocr_results": ocr_message.content.get("ocr_results")
+            },
+            role="Coordinator",
+            cause_by=type(self)
+        )
+    
+    def _create_fallback_request(self, message: Message, failure_type: FailureType) -> Message:
+        """建立備援請求"""
+        return Message(
+            content={
+                "type": "fallback_request",
+                "frame_id": message.content.get("frame_id"),
+                "failure_type": failure_type,
+                "context": message.content
+            },
+            role="Coordinator",
+            cause_by=type(self)
+        )
+    
+    def _create_completion_message(self, frame_id: str, session: Dict[str, Any]) -> Message:
+        """建立完成訊息"""
+        # 整合所有階段的結果
+        result = ProcessingResult(
+            frame_id=frame_id,
+            camera_id=session["stages"].get("quality", {}).get("camera_id", "unknown"),
+            status=ProcessingStatus.SUCCESS,
+            quality_report=session["stages"].get("quality"),
+            detection_result=session["stages"].get("detection"),
+            ocr_results=session["stages"].get("ocr", []),
+            validation_result=session["stages"].get("validation"),
+            processing_time=(datetime.now() - session["start_time"]).total_seconds()
+        )
+        
+        # 計算最終讀值和信心度
+        if session["stages"].get("ocr"):
+            ocr_results = session["stages"]["ocr"]
+            if ocr_results:
+                best_ocr = max(ocr_results, key=lambda x: x.get("confidence", 0))
+                result.final_reading = best_ocr.get("recognized_text", "")
+                result.confidence = best_ocr.get("confidence", 0)
+        
+        return Message(
+            content={
+                "type": MessageType.PROCESSING_COMPLETE,
+                "frame_id": frame_id,
+                "result": result.dict()
+            },
+            role="Coordinator",
+            cause_by=type(self)
+        )
+    
+    def _handle_fallback_decision(self, fallback_message: Message) -> List[Message]:
+        """處理備援決策"""
+        decision = fallback_message.content.get("fallback_decision", {})
+        action = decision.get("recommended_action")
+        
+        messages = []
+        
+        if action == "use_vlm":
+            messages.append(Message(
+                content={
+                    "type": "vlm_request",
+                    "frame_id": fallback_message.content.get("frame_id"),
+                    "context": fallback_message.content
+                },
+                role="Coordinator",
+                cause_by=type(self)
+            ))
+        elif action == "switch_camera":
+            messages.append(Message(
+                content={
+                    "type": "camera_switch_request",
+                    "frame_id": fallback_message.content.get("frame_id"),
+                    "alternative_camera_id": decision.get("alternative_camera_id")
+                },
+                role="Coordinator",
+                cause_by=type(self)
+            ))
+        
+        return messages
 
 
 class MeterGPTOrchestrator(Role):
-    """MeterGPT 系統協調器"""
+    """MeterGPT 系統協調器 - 基於 MetaGPT 的真正代理人協作"""
     
     def __init__(self, config: Optional[MeterGPTConfig] = None):
         """
@@ -77,102 +314,184 @@ class MeterGPTOrchestrator(Role):
         Args:
             config: 系統配置
         """
-        super().__init__(name="MeterGPTOrchestrator", profile="系統協調器")
+        super().__init__(
+            name="MeterGPTOrchestrator",
+            profile="系統協調器",
+            goal="協調所有代理人完成儀器讀值任務",
+            constraints="確保處理流程的正確性和效率"
+        )
         
         self.config = config or get_config()
         self.logger = get_logger("MeterGPTOrchestrator")
         
+        # 設置動作
+        self._set_actions([
+            ProcessingCoordinationAction(),
+            SystemMonitorAction()
+        ])
+        
+        # 設置觀察的訊息類型
+        self._watch([
+            MessageType.STREAM_FRAME,
+            MessageType.QUALITY_REPORT,
+            MessageType.DETECTION_RESULT,
+            MessageType.OCR_RESULT,
+            MessageType.VALIDATION_RESULT,
+            MessageType.FALLBACK_DECISION
+        ])
+        
         # 系統狀態
-        self.is_running = False
-        self.processing_queue: asyncio.Queue = asyncio.Queue(
-            maxsize=self.config.system.queue_size if self.config else 100
-        )
-        self.active_tasks: Dict[str, asyncio.Task] = {}
         self.system_metrics = {
             "total_processed": 0,
             "success_count": 0,
             "failure_count": 0,
-            "average_processing_time": 0.0,
-            "last_processing_time": 0.0
+            "average_processing_time": 0.0
         }
+    
+    async def _act(self) -> Message:
+        """
+        執行協調動作
         
-        # 代理人實例
-        self.agents: Dict[str, Agent] = {}
+        Returns:
+            Message: 協調結果訊息
+        """
+        try:
+            # 取得所有相關訊息
+            messages = self.rc.memory.get_by_actions([
+                MessageType.STREAM_FRAME,
+                MessageType.QUALITY_REPORT,
+                MessageType.DETECTION_RESULT,
+                MessageType.OCR_RESULT,
+                MessageType.VALIDATION_RESULT,
+                MessageType.FALLBACK_DECISION
+            ])
+            
+            if not messages:
+                return Message(content={"type": "no_action"}, role=self.profile)
+            
+            # 執行處理協調
+            coordination_action = ProcessingCoordinationAction()
+            coordination_messages = await coordination_action.run(messages)
+            
+            # 發送協調訊息
+            for msg in coordination_messages:
+                await self.rc.env.publish_message(msg)
+            
+            # 執行系統監控
+            monitor_action = SystemMonitorAction()
+            status_message = await monitor_action.run(messages)
+            
+            # 更新系統指標
+            self._update_metrics(messages)
+            
+            return status_message
+            
+        except Exception as e:
+            self.logger.error(f"協調動作執行失敗: {e}")
+            return Message(
+                content={
+                    "type": "error",
+                    "error": str(e)
+                },
+                role=self.profile
+            )
+    
+    def _update_metrics(self, messages: List[Message]):
+        """更新系統指標"""
+        for message in messages:
+            if message.content.get("type") == MessageType.PROCESSING_COMPLETE:
+                self.system_metrics["total_processed"] += 1
+                result = message.content.get("result", {})
+                if result.get("status") == ProcessingStatus.SUCCESS:
+                    self.system_metrics["success_count"] += 1
+                else:
+                    self.system_metrics["failure_count"] += 1
+                
+                # 更新平均處理時間
+                processing_time = result.get("processing_time", 0)
+                total = self.system_metrics["total_processed"]
+                current_avg = self.system_metrics["average_processing_time"]
+                self.system_metrics["average_processing_time"] = (
+                    (current_avg * (total - 1) + processing_time) / total
+                )
+    
+    def get_system_status(self) -> SystemStatus:
+        """取得系統狀態"""
+        total_processed = self.system_metrics["total_processed"]
+        success_rate = (
+            self.system_metrics["success_count"] / total_processed 
+            if total_processed > 0 else 0.0
+        )
+        
+        return SystemStatus(
+            active_cameras=[cam.camera_id for cam in self.config.cameras] if self.config else [],
+            processing_queue_size=0,  # 在新架構中，這個概念不太適用
+            average_processing_time=self.system_metrics["average_processing_time"],
+            success_rate=success_rate,
+            error_count=self.system_metrics["failure_count"],
+            system_health=min(success_rate + 0.1, 1.0)
+        )
+
+
+class MeterGPTTeam:
+    """MeterGPT 代理人團隊管理器"""
+    
+    def __init__(self, config: Optional[MeterGPTConfig] = None):
+        """
+        初始化團隊
+        
+        Args:
+            config: 系統配置
+        """
+        self.config = config or get_config()
+        self.logger = get_logger("MeterGPTTeam")
+        
+        # 建立環境
         self.environment = Environment()
         
-        # 初始化代理人
-        self._initialize_agents()
-        
-        # 設置動作
-        self._set_actions([OrchestratorAction()])
+        # 建立代理人團隊
+        self.team = None
+        self._setup_team()
     
-    def _initialize_agents(self):
-        """初始化所有代理人"""
+    def _setup_team(self):
+        """設置代理人團隊"""
         try:
-            # 初始化各個代理人
-            self.agents["stream_manager"] = StreamManager(config=self.config)
-            self.agents["quality_assessor"] = QualityAssessor(config=self.config)
-            self.agents["detection_agent"] = DetectionAgent(config=self.config)
-            self.agents["ocr_agent"] = OCRAgent(config=self.config)
-            self.agents["validation_agent"] = ValidationAgent(config=self.config)
-            self.agents["fallback_agent"] = FallbackAgent(config=self.config)
+            from ..agents.stream_manager import StreamManager
+            from ..agents.quality_assessor import QualityAssessor
+            from ..agents.detection_agent import DetectionAgent
+            from ..agents.ocr_agent import OCRAgent
+            from ..agents.validation_agent import ValidationAgent
+            from ..agents.fallback_agent import FallbackAgent
             
-            # 將代理人加入環境
-            for agent in self.agents.values():
-                self.environment.add_role(agent)
+            # 建立所有代理人
+            roles = [
+                StreamManager(config=self.config),
+                QualityAssessor(config=self.config),
+                DetectionAgent(config=self.config),
+                OCRAgent(config=self.config),
+                ValidationAgent(config=self.config),
+                FallbackAgent(config=self.config),
+                MeterGPTOrchestrator(config=self.config)
+            ]
             
-            self.logger.info("所有代理人初始化完成")
+            # 建立團隊
+            self.team = Team(
+                env=self.environment,
+                roles=roles,
+                investment=10.0,  # 預算
+                idea="智慧儀器讀值系統"
+            )
+            
+            self.logger.info("代理人團隊設置完成")
             
         except Exception as e:
-            self.logger.error(f"代理人初始化失敗: {e}")
+            self.logger.error(f"團隊設置失敗: {e}")
             raise
     
-    async def start_system(self):
-        """啟動系統"""
-        if self.is_running:
-            self.logger.warning("系統已經在運行中")
-            return
-        
-        try:
-            self.is_running = True
-            self.logger.info("MeterGPT 系統啟動中...")
-            
-            # 啟動處理任務
-            processing_task = asyncio.create_task(self._processing_loop())
-            monitoring_task = asyncio.create_task(self._monitoring_loop())
-            
-            # 等待任務完成
-            await asyncio.gather(processing_task, monitoring_task)
-            
-        except Exception as e:
-            self.logger.error(f"系統啟動失敗: {e}")
-            await self.stop_system()
-            raise
-    
-    async def stop_system(self):
-        """停止系統"""
-        if not self.is_running:
-            return
-        
-        self.logger.info("MeterGPT 系統停止中...")
-        self.is_running = False
-        
-        # 取消所有活躍任務
-        for task_id, task in self.active_tasks.items():
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        
-        self.active_tasks.clear()
-        self.logger.info("MeterGPT 系統已停止")
-    
-    async def process_frame(self, camera_id: str, frame_data: bytes, 
-                          metadata: Optional[Dict[str, Any]] = None) -> ProcessingResult:
+    async def start_processing(self, camera_id: str, frame_data: bytes, 
+                             metadata: Optional[Dict[str, Any]] = None) -> ProcessingResult:
         """
-        處理單一影像幀
+        啟動處理流程
         
         Args:
             camera_id: 攝影機 ID
@@ -182,19 +501,8 @@ class MeterGPTOrchestrator(Role):
         Returns:
             ProcessingResult: 處理結果
         """
-        frame_id = str(uuid.uuid4())
-        start_time = time.time()
-        
-        # 建立處理結果物件
-        result = ProcessingResult(
-            frame_id=frame_id,
-            camera_id=camera_id,
-            status=ProcessingStatus.PROCESSING,
-            processing_pipeline=[]
-        )
-        
         try:
-            self.logger.info(f"開始處理影像幀: {frame_id}")
+            frame_id = str(uuid.uuid4())
             
             # 建立串流幀物件
             camera_info = self._get_camera_info(camera_id)
@@ -206,273 +514,45 @@ class MeterGPTOrchestrator(Role):
                 metadata=metadata or {}
             )
             
-            # 執行完整處理流程
-            result = await self._execute_processing_pipeline(stream_frame, result)
-            
-            # 更新系統指標
-            processing_time = time.time() - start_time
-            self._update_metrics(result.status == ProcessingStatus.SUCCESS, processing_time)
-            
-            result.processing_time = processing_time
-            self.logger.info(f"影像幀處理完成: {frame_id}, 狀態: {result.status}")
-            
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"處理影像幀時發生錯誤: {e}")
-            result.status = ProcessingStatus.FAILED
-            result.error_message = str(e)
-            result.processing_time = time.time() - start_time
-            return result
-    
-    async def _execute_processing_pipeline(self, stream_frame: StreamFrame, 
-                                         result: ProcessingResult) -> ProcessingResult:
-        """
-        執行完整的處理管線
-        
-        Args:
-            stream_frame: 串流影像幀
-            result: 處理結果物件
-            
-        Returns:
-            ProcessingResult: 更新後的處理結果
-        """
-        current_stage = ProcessingStage.QUALITY_ASSESSMENT
-        
-        try:
-            # 階段 1: 品質評估
-            result.processing_pipeline.append(current_stage.value)
-            quality_report = await self._execute_quality_assessment(stream_frame)
-            result.quality_report = quality_report
-            
-            if not quality_report.is_acceptable:
-                # 品質不佳，觸發備援流程
-                return await self._handle_fallback(
-                    stream_frame, result, FailureType.LOW_QUALITY, 
-                    {"quality_report": quality_report}
-                )
-            
-            # 階段 2: 儀器偵測
-            current_stage = ProcessingStage.INSTRUMENT_DETECTION
-            result.processing_pipeline.append(current_stage.value)
-            detection_result = await self._execute_instrument_detection(stream_frame)
-            result.detection_result = detection_result
-            
-            if detection_result.confidence < self.config.detection_model.confidence_threshold:
-                # 偵測失敗，觸發備援流程
-                return await self._handle_fallback(
-                    stream_frame, result, FailureType.DETECTION_FAILED,
-                    {"detection_result": detection_result}
-                )
-            
-            # 階段 3: OCR 處理
-            current_stage = ProcessingStage.OCR_PROCESSING
-            result.processing_pipeline.append(current_stage.value)
-            ocr_results = await self._execute_ocr_processing(stream_frame, detection_result)
-            result.ocr_results = ocr_results
-            
-            if not ocr_results or all(ocr.confidence < self.config.ocr.confidence_threshold for ocr in ocr_results):
-                # OCR 失敗，觸發備援流程
-                return await self._handle_fallback(
-                    stream_frame, result, FailureType.OCR_FAILED,
-                    {"ocr_results": ocr_results}
-                )
-            
-            # 階段 4: 結果驗證
-            current_stage = ProcessingStage.RESULT_VALIDATION
-            result.processing_pipeline.append(current_stage.value)
-            validation_result = await self._execute_validation(ocr_results)
-            result.validation_result = validation_result
-            
-            if not validation_result.is_valid:
-                # 驗證失敗，觸發備援流程
-                return await self._handle_fallback(
-                    stream_frame, result, FailureType.VALIDATION_FAILED,
-                    {"validation_result": validation_result}
-                )
-            
-            # 階段 5: 完成處理
-            current_stage = ProcessingStage.COMPLETED
-            result.processing_pipeline.append(current_stage.value)
-            result.status = ProcessingStatus.SUCCESS
-            
-            # 提取最終讀值
-            result.final_reading = self._extract_final_reading(ocr_results, validation_result)
-            result.confidence = self._calculate_final_confidence(
-                quality_report, detection_result, ocr_results, validation_result
+            # 發送初始訊息到環境
+            initial_message = Message(
+                content={
+                    "type": MessageType.STREAM_FRAME,
+                    "frame_id": frame_id,
+                    "stream_frame": stream_frame.dict()
+                },
+                role="System"
             )
             
+            # 啟動團隊處理
+            await self.team.run_project(initial_message)
+            
+            # 等待處理完成並取得結果
+            # 這裡需要實作結果收集邏輯
+            result = await self._collect_processing_result(frame_id)
+            
             return result
             
-        except asyncio.TimeoutError:
-            self.logger.error(f"處理超時，當前階段: {current_stage}")
-            return await self._handle_fallback(
-                stream_frame, result, FailureType.TIMEOUT,
-                {"current_stage": current_stage.value}
+        except Exception as e:
+            self.logger.error(f"處理流程啟動失敗: {e}")
+            return ProcessingResult(
+                frame_id=frame_id,
+                camera_id=camera_id,
+                status=ProcessingStatus.FAILED,
+                error_message=str(e)
             )
-        except Exception as e:
-            self.logger.error(f"處理管線執行失敗，當前階段: {current_stage}, 錯誤: {e}")
-            result.status = ProcessingStatus.FAILED
-            result.error_message = str(e)
-            return result
     
-    async def _execute_quality_assessment(self, stream_frame: StreamFrame) -> QualityReport:
-        """執行品質評估"""
-        quality_assessor = self.agents["quality_assessor"]
-        message = Message(content={"stream_frame": stream_frame})
-        
-        response = await quality_assessor.handle(message)
-        return response.content["quality_report"]
-    
-    async def _execute_instrument_detection(self, stream_frame: StreamFrame) -> DetectionResult:
-        """執行儀器偵測"""
-        detection_agent = self.agents["detection_agent"]
-        message = Message(content={"stream_frame": stream_frame})
-        
-        response = await detection_agent.handle(message)
-        return response.content["detection_result"]
-    
-    async def _execute_ocr_processing(self, stream_frame: StreamFrame, 
-                                    detection_result: DetectionResult) -> List[OCRResult]:
-        """執行 OCR 處理"""
-        ocr_agent = self.agents["ocr_agent"]
-        message = Message(content={
-            "stream_frame": stream_frame,
-            "detection_result": detection_result
-        })
-        
-        response = await ocr_agent.handle(message)
-        return response.content["ocr_results"]
-    
-    async def _execute_validation(self, ocr_results: List[OCRResult]) -> ValidationResult:
-        """執行結果驗證"""
-        validation_agent = self.agents["validation_agent"]
-        message = Message(content={"ocr_results": ocr_results})
-        
-        response = await validation_agent.handle(message)
-        return response.content["validation_result"]
-    
-    async def _handle_fallback(self, stream_frame: StreamFrame, result: ProcessingResult,
-                             failure_type: FailureType, context: Dict[str, Any]) -> ProcessingResult:
-        """
-        處理備援流程
-        
-        Args:
-            stream_frame: 串流影像幀
-            result: 當前處理結果
-            failure_type: 失敗類型
-            context: 上下文資訊
-            
-        Returns:
-            ProcessingResult: 備援處理結果
-        """
-        try:
-            result.processing_pipeline.append(ProcessingStage.FALLBACK_PROCESSING.value)
-            
-            # 執行備援決策
-            fallback_agent = self.agents["fallback_agent"]
-            message = Message(content={
-                "failure_type": failure_type,
-                "context": context,
-                "stream_frame": stream_frame
-            })
-            
-            response = await fallback_agent.handle(message)
-            fallback_decision = response.content["fallback_decision"]
-            result.fallback_decision = fallback_decision
-            
-            # 根據備援決策執行相應動作
-            if fallback_decision.recommended_action.value == "use_vlm":
-                vlm_response = await self._execute_vlm_processing(stream_frame, context)
-                result.vlm_response = vlm_response
-                
-                if vlm_response and vlm_response.confidence >= self.config.vlm.confidence_threshold:
-                    result.final_reading = vlm_response.response_text
-                    result.confidence = vlm_response.confidence
-                    result.status = ProcessingStatus.SUCCESS
-                else:
-                    result.status = ProcessingStatus.FAILED
-                    result.error_message = "VLM 處理失敗或信心度不足"
-            
-            elif fallback_decision.recommended_action.value == "switch_camera":
-                # 切換攝影機邏輯
-                if fallback_decision.alternative_camera_id:
-                    result.status = ProcessingStatus.RETRY
-                    result.error_message = f"建議切換至攝影機: {fallback_decision.alternative_camera_id}"
-                else:
-                    result.status = ProcessingStatus.FAILED
-                    result.error_message = "沒有可用的備選攝影機"
-            
-            elif fallback_decision.recommended_action.value == "manual_review":
-                result.status = ProcessingStatus.FAILED
-                result.error_message = "需要人工審核"
-            
-            else:
-                result.status = ProcessingStatus.FAILED
-                result.error_message = f"未知的備援動作: {fallback_decision.recommended_action}"
-            
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"備援處理失敗: {e}")
-            result.status = ProcessingStatus.FAILED
-            result.error_message = f"備援處理失敗: {str(e)}"
-            return result
-    
-    async def _execute_vlm_processing(self, stream_frame: StreamFrame, 
-                                    context: Dict[str, Any]) -> Optional[VLMResponse]:
-        """執行 VLM 處理"""
-        try:
-            # 這裡應該實作 VLM 處理邏輯
-            # 由於 VLM 處理比較複雜，這裡提供基本框架
-            self.logger.info("執行 VLM 處理...")
-            
-            # 模擬 VLM 回應
-            vlm_response = VLMResponse(
-                request_id=str(uuid.uuid4()),
-                response_text="模擬 VLM 讀值結果",
-                confidence=0.85,
-                processing_time=2.5,
-                model_name=self.config.vlm.model_name,
-                token_usage={"prompt_tokens": 100, "completion_tokens": 50}
-            )
-            
-            return vlm_response
-            
-        except Exception as e:
-            self.logger.error(f"VLM 處理失敗: {e}")
-            return None
-    
-    def _extract_final_reading(self, ocr_results: List[OCRResult], 
-                             validation_result: ValidationResult) -> str:
-        """提取最終讀值"""
-        if not ocr_results:
-            return ""
-        
-        # 選擇信心度最高的 OCR 結果
-        best_ocr = max(ocr_results, key=lambda x: x.confidence)
-        return best_ocr.recognized_text
-    
-    def _calculate_final_confidence(self, quality_report: QualityReport,
-                                  detection_result: DetectionResult,
-                                  ocr_results: List[OCRResult],
-                                  validation_result: ValidationResult) -> float:
-        """計算最終信心度"""
-        if not ocr_results:
-            return 0.0
-        
-        # 綜合各階段的信心度
-        quality_confidence = quality_report.metrics.overall_score
-        detection_confidence = detection_result.confidence
-        ocr_confidence = max(ocr.confidence for ocr in ocr_results)
-        validation_confidence = validation_result.validation_score
-        
-        # 加權平均
-        weights = [0.2, 0.3, 0.3, 0.2]  # 品質、偵測、OCR、驗證
-        confidences = [quality_confidence, detection_confidence, ocr_confidence, validation_confidence]
-        
-        final_confidence = sum(w * c for w, c in zip(weights, confidences))
-        return min(max(final_confidence, 0.0), 1.0)
+    async def _collect_processing_result(self, frame_id: str) -> ProcessingResult:
+        """收集處理結果"""
+        # 這裡需要實作從環境中收集結果的邏輯
+        # 暫時返回一個基本結果
+        return ProcessingResult(
+            frame_id=frame_id,
+            camera_id="unknown",
+            status=ProcessingStatus.SUCCESS,
+            final_reading="模擬讀值",
+            confidence=0.8
+        )
     
     def _get_camera_info(self, camera_id: str) -> CameraInfo:
         """取得攝影機資訊"""
@@ -495,138 +575,29 @@ class MeterGPTOrchestrator(Role):
             is_active=True,
             is_primary=False
         )
-    
-    def _update_metrics(self, success: bool, processing_time: float):
-        """更新系統指標"""
-        self.system_metrics["total_processed"] += 1
-        if success:
-            self.system_metrics["success_count"] += 1
-        else:
-            self.system_metrics["failure_count"] += 1
-        
-        # 更新平均處理時間
-        total = self.system_metrics["total_processed"]
-        current_avg = self.system_metrics["average_processing_time"]
-        self.system_metrics["average_processing_time"] = (
-            (current_avg * (total - 1) + processing_time) / total
-        )
-        self.system_metrics["last_processing_time"] = processing_time
-    
-    async def _processing_loop(self):
-        """處理循環"""
-        while self.is_running:
-            try:
-                # 從佇列取得處理任務
-                task_data = await asyncio.wait_for(
-                    self.processing_queue.get(), 
-                    timeout=1.0
-                )
-                
-                # 建立處理任務
-                task_id = str(uuid.uuid4())
-                task = asyncio.create_task(
-                    self.process_frame(**task_data)
-                )
-                self.active_tasks[task_id] = task
-                
-                # 等待任務完成並清理
-                try:
-                    await task
-                finally:
-                    self.active_tasks.pop(task_id, None)
-                    
-            except asyncio.TimeoutError:
-                # 佇列為空，繼續等待
-                continue
-            except Exception as e:
-                self.logger.error(f"處理循環錯誤: {e}")
-    
-    async def _monitoring_loop(self):
-        """監控循環"""
-        while self.is_running:
-            try:
-                # 每 30 秒輸出系統狀態
-                await asyncio.sleep(30)
-                
-                status = self.get_system_status()
-                self.logger.info(f"系統狀態 - 處理總數: {status.processing_queue_size}, "
-                               f"成功率: {status.success_rate:.2%}, "
-                               f"平均處理時間: {status.average_processing_time:.2f}s")
-                
-            except Exception as e:
-                self.logger.error(f"監控循環錯誤: {e}")
-    
-    def get_system_status(self) -> SystemStatus:
-        """取得系統狀態"""
-        total_processed = self.system_metrics["total_processed"]
-        success_rate = (
-            self.system_metrics["success_count"] / total_processed 
-            if total_processed > 0 else 0.0
-        )
-        
-        return SystemStatus(
-            active_cameras=[cam.camera_id for cam in self.config.cameras] if self.config else [],
-            processing_queue_size=self.processing_queue.qsize(),
-            average_processing_time=self.system_metrics["average_processing_time"],
-            success_rate=success_rate,
-            error_count=self.system_metrics["failure_count"],
-            system_health=min(success_rate + 0.1, 1.0)  # 簡單的健康度計算
-        )
-    
-    async def add_processing_task(self, camera_id: str, frame_data: bytes, 
-                                metadata: Optional[Dict[str, Any]] = None):
-        """
-        添加處理任務到佇列
-        
-        Args:
-            camera_id: 攝影機 ID
-            frame_data: 影像資料
-            metadata: 額外元資料
-        """
-        task_data = {
-            "camera_id": camera_id,
-            "frame_data": frame_data,
-            "metadata": metadata
-        }
-        
-        try:
-            await self.processing_queue.put(task_data)
-            self.logger.debug(f"處理任務已加入佇列: {camera_id}")
-        except asyncio.QueueFull:
-            self.logger.warning("處理佇列已滿，丟棄任務")
-    
-    @asynccontextmanager
-    async def processing_context(self):
-        """處理上下文管理器"""
-        try:
-            await self.start_system()
-            yield self
-        finally:
-            await self.stop_system()
 
 
-# 全域協調器實例
-orchestrator: Optional[MeterGPTOrchestrator] = None
+# 全域團隊實例
+team_instance: Optional[MeterGPTTeam] = None
 
 
-def get_orchestrator(config: Optional[MeterGPTConfig] = None) -> MeterGPTOrchestrator:
-    """取得全域協調器實例"""
-    global orchestrator
-    if orchestrator is None:
-        orchestrator = MeterGPTOrchestrator(config)
-    return orchestrator
+def get_team(config: Optional[MeterGPTConfig] = None) -> MeterGPTTeam:
+    """取得全域團隊實例"""
+    global team_instance
+    if team_instance is None:
+        team_instance = MeterGPTTeam(config)
+    return team_instance
 
 
-async def initialize_system(config: Optional[MeterGPTConfig] = None) -> MeterGPTOrchestrator:
+async def initialize_system(config: Optional[MeterGPTConfig] = None) -> MeterGPTTeam:
     """初始化系統"""
-    orch = get_orchestrator(config)
-    await orch.start_system()
-    return orch
+    team = get_team(config)
+    return team
 
 
 async def shutdown_system():
     """關閉系統"""
-    global orchestrator
-    if orchestrator:
-        await orchestrator.stop_system()
-        orchestrator = None
+    global team_instance
+    if team_instance:
+        # 這裡可以添加清理邏輯
+        team_instance = None

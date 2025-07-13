@@ -170,3 +170,6 @@ datasets/
 output/
 results/
 experiments/
+
+# Third-party libraries
+MetaGPT/
